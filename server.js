@@ -5,35 +5,14 @@ const path = require('path');
 const mongoose = require('mongoose');
 const axios = require('axios');
 const bcrypt = require('bcryptjs'); 
+const http = require('http'); // Required for Socket.io
+const { Server } = require('socket.io'); // Import Socket.io
 
 const app = express();
+const server = http.createServer(app); // Wrap express in HTTP server
 
 // ==========================================
-// TELEGRAM BOT UTILITY
-// ==========================================
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
-
-// Fire-and-forget background function
-function sendTelegramMessage(message) {
-    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
-        console.log("Telegram alert missed (Credentials missing in .env):", message);
-        return;
-    }
-    
-    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-    
-    axios.post(url, {
-        chat_id: TELEGRAM_CHAT_ID,
-        text: message,
-        parse_mode: 'HTML' 
-    }).catch(err => {
-        console.error("Telegram Notification Error:", err.message);
-    });
-}
-
-// ==========================================
-// CORS CONFIGURATION
+// CORS & SOCKET CONFIGURATION
 // ==========================================
 const allowedOrigins = [
     'http://localhost:3000',
@@ -54,8 +33,57 @@ app.use(cors({
     credentials: true
 }));
 
+const io = new Server(server, {
+    cors: { origin: "*", methods: ["GET", "POST"] }
+});
+
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
+
+// ==========================================
+// REAL-TIME SOCKET HANDLER
+// ==========================================
+const activeSockets = {}; // Maps phone numbers to socket IDs
+
+io.on('connection', (socket) => {
+    // Register user phone to target specific notifications
+    socket.on('register_user', (phone) => {
+        if(phone) activeSockets[phone] = socket.id;
+    });
+
+    // Join specific chat room for live support
+    socket.on('join_chat', (chatId) => {
+        socket.join(chatId);
+    });
+
+    socket.on('disconnect', () => {
+        for (let phone in activeSockets) {
+            if (activeSockets[phone] === socket.id) delete activeSockets[phone];
+        }
+    });
+});
+
+// Helper function to send instant alerts to specific users
+function sendPushNotification(phone, title, message, type) {
+    const socketId = activeSockets[phone];
+    if (socketId) {
+        io.to(socketId).emit('new_notification', { title, message, type, time: Date.now() });
+    }
+}
+
+// ==========================================
+// TELEGRAM BOT UTILITY
+// ==========================================
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+
+function sendTelegramMessage(message) {
+    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
+    
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+    axios.post(url, { chat_id: TELEGRAM_CHAT_ID, text: message, parse_mode: 'HTML' })
+        .catch(err => console.error("Telegram Notification Error:", err.message));
+}
 
 // ==========================================
 // MONGODB CONNECTION & MODELS
@@ -99,33 +127,11 @@ const transactionSchema = new mongoose.Schema({
 const Transaction = mongoose.model('Transaction', transactionSchema);
 
 const liveGameSchema = new mongoose.Schema({
-    id: Number,
-    category: String,
-    home: String,
-    away: String,
-    odds: String,
-    draw: String,
-    away_odds: String,
-    time: String,
+    id: Number, category: String, home: String, away: String,
+    odds: String, draw: String, away_odds: String, time: String,
     status: { type: String, default: 'upcoming' }
 }, { strict: false }); 
 const LiveGame = mongoose.model('LiveGame', liveGameSchema);
-
-
-// ==========================================
-// SECURE ODDS API PROXY 
-// ==========================================
-const ODDS_API_KEY = process.env.ODDS_API_KEY;
-
-app.get('/api/sports', async (req, res) => {
-    try {
-        const response = await axios.get(`https://api.the-odds-api.com/v4/sports/?apiKey=${ODDS_API_KEY}`);
-        res.json(response.data);
-    } catch (error) {
-        console.error('Odds API Sports Error:', error.message);
-        res.status(500).json({ error: 'Failed to fetch sports' });
-    }
-});
 
 
 // ==========================================
@@ -134,7 +140,6 @@ app.get('/api/sports', async (req, res) => {
 app.post('/api/register', async (req, res) => {
     try {
         const { phone, password, name } = req.body;
-        
         if (!phone || !password) return res.status(400).json({ success: false, message: 'Phone and password are required.' });
 
         const existingUser = await User.findOne({ phone });
@@ -149,7 +154,7 @@ app.post('/api/register', async (req, res) => {
         sendTelegramMessage(`🚨 <b>NEW USER REGISTRATION</b> 🚨\n\n👤 <b>Name:</b> ${newUser.name}\n📱 <b>Phone:</b> ${newUser.phone}`);
         res.json({ success: true, user: { name: newUser.name, balance: newUser.balance, phone: newUser.phone } });
     } catch (error) {
-        res.status(500).json({ success: false, message: 'Server crash details: ' + error.message });
+        res.status(500).json({ success: false, message: 'Server error' });
     }
 });
 
@@ -243,6 +248,8 @@ app.post('/api/megapay/webhook', async (req, res) => {
             refId: receipt, userPhone: user.phone, type: "deposit", method: "M-Pesa", amount: amount, status: "Success"
         });
 
+        // 🔔 REAL-TIME DEPOSIT ALERT
+        sendPushNotification(user.phone, "Deposit Successful", `Your deposit of KES ${amount} has been credited.`, "deposit");
         sendTelegramMessage(`✅ <b>DEPOSIT CONFIRMED</b> ✅\n\n👤 <b>User:</b> ${user.phone}\n💰 <b>Amount:</b> KES ${amount}\n🧾 <b>Receipt:</b> ${receipt}\n💵 <b>New Balance:</b> KES ${user.balance.toLocaleString()}`);
     } catch (err) { 
         console.error("Webhook Processing Error:", err); 
@@ -262,6 +269,8 @@ app.post('/api/withdraw', async (req, res) => {
         const refId = 'WD-' + Math.floor(100000 + Math.random() * 900000);
         await Transaction.create({ refId, userPhone, type: 'withdraw', method, amount: -Number(amount), status: 'Success' });
 
+        // 🔔 REAL-TIME WITHDRAW ALERT
+        sendPushNotification(user.phone, "Withdrawal Sent", `KES ${amount} has been sent to your M-Pesa.`, "withdraw");
         sendTelegramMessage(`💸 <b>WITHDRAWAL REQUEST</b> 💸\n\n👤 <b>User:</b> ${user.phone}\n💰 <b>Amount:</b> KES ${amount}\n🧾 <b>Ref:</b> ${refId}\n💵 <b>Remaining Balance:</b> KES ${user.balance.toLocaleString()}`);
 
         res.json({ success: true, newBalance: user.balance, refId });
@@ -323,7 +332,6 @@ app.get('/api/bets/:phone', async (req, res) => {
     }
 });
 
-// CASHOUT ENDPOINT
 app.post('/api/cashout', async (req, res) => {
     try {
         const { ticketId, userPhone, amount } = req.body;
@@ -335,16 +343,16 @@ app.post('/api/cashout', async (req, res) => {
         const user = await User.findOne({ phone: userPhone });
         if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
 
-        // Update Bet Status
         bet.status = 'Cashed Out';
         await bet.save();
 
-        // Add funds to user
         user.balance += amount;
         await user.save();
 
-        // Log Transaction
         await Transaction.create({ refId: `CO-${ticketId}`, userPhone, type: 'cashout', method: 'Cashout', amount: amount });
+
+        // 🔔 REAL-TIME CASHOUT ALERT
+        sendPushNotification(user.phone, "Bet Cashed Out", `You successfully cashed out KES ${amount}.`, "cashout");
 
         res.json({ success: true, message: 'Cashout successful', newBalance: user.balance });
     } catch (error) { 
@@ -360,29 +368,24 @@ setInterval(async () => {
         const openBets = await Bet.find({ status: 'Open' });
         
         for (let bet of openBets) {
-            // 80% chance it stays open to simulate waiting for a real game to finish
+            // 80% chance it stays open
             if (Math.random() > 0.20) continue; 
 
-            // If it finishes: 40% chance it wins, 60% chance it loses
+            // 40% chance to win, 60% chance to lose
             const isWin = Math.random() < 0.40;
             
             bet.status = isWin ? 'Won' : 'Lost';
             await bet.save();
 
-            // Payout user if they won
             if (isWin) {
                 const user = await User.findOne({ phone: bet.userPhone });
                 if (user) {
                     user.balance += bet.potentialWin;
                     await user.save();
+                    await Transaction.create({ refId: `WIN-${bet.ticketId}`, userPhone: user.phone, type: 'win', method: 'Bet Winnings', amount: bet.potentialWin });
                     
-                    await Transaction.create({ 
-                        refId: `WIN-${bet.ticketId}`, 
-                        userPhone: user.phone, 
-                        type: 'win', 
-                        method: 'Bet Winnings', 
-                        amount: bet.potentialWin 
-                    });
+                    // 🔔 REAL-TIME WIN ALERT
+                    sendPushNotification(user.phone, "Bet Won! 🥳", `Ticket ${bet.ticketId} won! KES ${bet.potentialWin} added to your balance.`, "win");
                 }
             }
         }
@@ -392,7 +395,7 @@ setInterval(async () => {
 }, 60 * 60 * 1000); // Runs every 60 minutes
 
 // ==========================================
-// ADMIN ROUTES (MANAGE USERS, BALANCES, GAMES)
+// ADMIN ROUTES & PUSH ALERTS
 // ==========================================
 app.get('/api/admin/users', async (req, res) => {
     try {
@@ -433,7 +436,17 @@ app.delete('/api/admin/users/:phone', async (req, res) => {
     }
 });
 
-// Admin Inject Game Route
+// Trigger a push alert from Admin Panel
+app.post('/api/admin/push-alert', (req, res) => {
+    const { phone, title, message } = req.body;
+    if(phone === 'ALL') {
+        io.emit('new_notification', { title, message, type: 'admin_alert', time: Date.now() });
+    } else {
+        sendPushNotification(phone, title, message, 'admin_alert');
+    }
+    res.json({success: true, message: "Alert sent!"});
+});
+
 app.post('/api/games', async (req, res) => {
     try {
         const { games, mode } = req.body;
@@ -449,7 +462,6 @@ app.post('/api/games', async (req, res) => {
     }
 });
 
-// Admin Clear Games Route
 app.delete('/api/games', async (req, res) => {
     try {
         await LiveGame.deleteMany({});
@@ -459,34 +471,95 @@ app.delete('/api/games', async (req, res) => {
     }
 });
 
+// ==========================================
+// TELEGRAM LIVE CHAT BRIDGE (TWO-WAY WEB-SOCKETS)
+// ==========================================
+const activeChats = {};
+
+app.get('/api/telegram/setup', async (req, res) => {
+    const appUrl = process.env.APP_URL || 'https://apex-efwz.onrender.com';
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook?url=${appUrl}/api/telegram/webhook`;
+    try {
+        const response = await axios.get(url);
+        res.json({ message: "Webhook successfully linked!", data: response.data });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/api/support/chat-start', (req, res) => {
+    const { phone, chatId } = req.body;
+    sendTelegramMessage(`💬 <b>LIVE CHAT OPENED</b> 💬\n\n👤 <b>User:</b> ${phone || 'Guest'}\n🔑 <b>ID:</b> ${chatId}`);
+    res.json({ success: true });
+});
+
+app.post('/api/chat/send', async (req, res) => {
+    const { chatId, text, phone } = req.body;
+    
+    if (!activeChats[chatId]) activeChats[chatId] = [];
+    activeChats[chatId].push({ sender: 'user', text });
+
+    const tgMessage = `💬 <b>New Message</b>\n👤 <b>User:</b> ${phone || 'Guest'}\n🔑 <b>ID:</b> ${chatId}\n\n${text}`;
+    
+    try {
+        await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, { chat_id: TELEGRAM_CHAT_ID, text: tgMessage, parse_mode: 'HTML' });
+        res.json({ success: true });
+    } catch (e) {
+        res.status(500).json({ success: false, message: 'Telegram failed' });
+    }
+});
+
+app.get('/api/chat/sync', (req, res) => {
+    const { chatId } = req.query;
+    res.json({ success: true, messages: activeChats[chatId] || [] });
+});
+
+// Catch replies from Telegram -> Route to Website instantly via Socket
+app.post('/api/telegram/webhook', (req, res) => {
+    res.sendStatus(200); 
+    
+    try {
+        const message = req.body.message;
+        if (!message || !message.reply_to_message || !message.text) return;
+
+        const originalText = message.reply_to_message.text;
+        const match = originalText.match(/ID:\s*([^\n]+)/);
+        
+        if (match && match[1]) {
+            const chatId = match[1].trim();
+            if (!activeChats[chatId]) activeChats[chatId] = [];
+            activeChats[chatId].push({ sender: 'admin', text: message.text });
+            
+            // Push via Socket instantly to the user's specific room
+            io.to(chatId).emit('admin_reply', { sender: 'admin', text: message.text });
+        }
+    } catch(e) {
+        console.error("Webhook processing error:", e);
+    }
+});
+
 
 // ==========================================
 // UNIFIED GAMES ENDPOINT (PRO MULTI-FETCH CACHING)
 // ==========================================
-
 let cachedApiGames = [];
 let lastApiFetchTime = 0;
-const API_CACHE_DURATION = 10 * 60 * 1000; // Cache API results for 10 minutes to save API quota
+const API_CACHE_DURATION = 10 * 60 * 1000;
 
 app.get('/api/games', async (req, res) => {
     try {
-        // 1. Fetch Manual Games injected by Admin
         const dbGamesRaw = await LiveGame.find({});
         let allGames = dbGamesRaw.map(g => g.toObject());
 
-        // 2. Fetch Multi-League Live API Games simultaneously
         if (ODDS_API_KEY) {
             const now = Date.now();
             
             if (now - lastApiFetchTime > API_CACHE_DURATION || cachedApiGames.length === 0) {
                 try {
-                    console.log("Fetching heavy data from Odds API...");
-                    
-                    // Fetch EPL, La Liga, and General Upcoming games at the exact same time
                     const [eplRes, ligaRes, upcomingRes] = await Promise.allSettled([
                         axios.get(`https://api.the-odds-api.com/v4/sports/soccer_epl/odds/`, { params: { apiKey: ODDS_API_KEY, regions: 'eu,uk', markets: 'h2h,totals,btts', oddsFormat: 'decimal' } }),
                         axios.get(`https://api.the-odds-api.com/v4/sports/soccer_spain_la_liga/odds/`, { params: { apiKey: ODDS_API_KEY, regions: 'eu,uk', markets: 'h2h,totals,btts', oddsFormat: 'decimal' } }),
-                        axios.get(`https://api.the-odds-api.com/v4/sports/upcoming/odds/`, { params: { apiKey: ODDS_API_KEY, regions: 'eu,uk', markets: 'h2h', oddsFormat: 'decimal' } }) // Generic upcoming is just h2h to prevent crashes
+                        axios.get(`https://api.the-odds-api.com/v4/sports/upcoming/odds/`, { params: { apiKey: ODDS_API_KEY, regions: 'eu,uk', markets: 'h2h', oddsFormat: 'decimal' } })
                     ]);
 
                     let rawApiGames = [];
@@ -494,20 +567,16 @@ app.get('/api/games', async (req, res) => {
                     if (ligaRes.status === 'fulfilled') rawApiGames = [...rawApiGames, ...ligaRes.value.data];
                     if (upcomingRes.status === 'fulfilled') rawApiGames = [...rawApiGames, ...upcomingRes.value.data];
 
-                    // Remove any overlapping duplicates between upcoming and specific leagues
                     const uniqueGamesMap = new Map();
                     rawApiGames.forEach(g => { if (!uniqueGamesMap.has(g.id)) uniqueGamesMap.set(g.id, g); });
                     const uniqueGames = Array.from(uniqueGamesMap.values());
 
-                    // 3. Deep Market Parser & Math Calculator
                     cachedApiGames = uniqueGames.map(m => {
                         let h = "0.00", d = null, a = "0.00";
                         let extra = { o25: "-", u25: "-", bY: "-", bN: "-", dc1x: "-", dc12: "-", dcx2: "-", dnb1: "-", dnb2: "-" };
                         
                         if (m.bookmakers && m.bookmakers.length > 0) {
                             const markets = m.bookmakers[0].markets;
-                            
-                            // Extract H2H
                             const h2h = markets.find(mk => mk.key === 'h2h');
                             if (h2h && h2h.outcomes) {
                                 const outHome = h2h.outcomes.find(o => o.name === m.home_team);
@@ -518,7 +587,6 @@ app.get('/api/games', async (req, res) => {
                                 if(outAway) a = outAway.price.toFixed(2);
                                 if(outDraw) d = outDraw.price.toFixed(2);
 
-                                // Math calculation for double chance/DNB
                                 if (h !== "0.00" && a !== "0.00") {
                                     const p1 = 1 / parseFloat(h), p2 = 1 / parseFloat(a), pX = d ? (1 / parseFloat(d)) : 0;
                                     if (d) {
@@ -531,7 +599,6 @@ app.get('/api/games', async (req, res) => {
                                 }
                             }
 
-                            // Extract Totals
                             const totals = markets.find(mk => mk.key === 'totals');
                             if (totals && totals.outcomes) {
                                 const over = totals.outcomes.find(o => o.name.toLowerCase() === 'over');
@@ -540,7 +607,6 @@ app.get('/api/games', async (req, res) => {
                                 if (under) extra.u25 = under.price.toFixed(2);
                             }
 
-                            // Extract BTTS
                             const btts = markets.find(mk => mk.key === 'btts');
                             if (btts && btts.outcomes) {
                                 const bY = btts.outcomes.find(o => o.name.toLowerCase() === 'yes');
@@ -550,7 +616,6 @@ app.get('/api/games', async (req, res) => {
                             }
                         }
 
-                        // Smart Live Status Formatting
                         const matchTime = new Date(m.commence_time);
                         const diffMins = Math.floor((Date.now() - matchTime) / 60000);
                         
@@ -569,7 +634,6 @@ app.get('/api/games', async (req, res) => {
                             timeStr = `Tomorrow, ${timeStr}`;
                         }
 
-                        // Filter out broken games that have 0 odds
                         if(h === "0.00" || a === "0.00") return null;
 
                         return {
@@ -580,12 +644,10 @@ app.get('/api/games', async (req, res) => {
                     }).filter(game => game !== null);
 
                     lastApiFetchTime = now;
-                    console.log(`✅ Cached ${cachedApiGames.length} unified games.`);
                 } catch (apiErr) {
                     console.error("Odds API Integration Error:", apiErr.message);
                 }
             }
-            // Append cached API games to manual DB games
             allGames = [...allGames, ...cachedApiGames];
         }
 
@@ -596,90 +658,10 @@ app.get('/api/games', async (req, res) => {
     }
 });
 
-
-// ==========================================
-// TELEGRAM LIVE CHAT BRIDGE (TWO-WAY)
-// ==========================================
-const activeChats = {}; // Stores chat history temporarily in memory
-
-// 1. Setup Webhook (Tells Telegram to send replies to this server)
-app.get('/api/telegram/setup', async (req, res) => {
-    const appUrl = process.env.APP_URL || 'https://apex-efwz.onrender.com';
-    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook?url=${appUrl}/api/telegram/webhook`;
-    try {
-        const response = await axios.get(url);
-        res.json({ message: "Webhook successfully linked!", data: response.data });
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
-});
-
-// Chat Ping Event (Triggers when the modal is opened)
-app.post('/api/support/chat-start', (req, res) => {
-    const { phone } = req.body;
-    sendTelegramMessage(`💬 <b>LIVE CHAT OPENED</b> 💬\n\n👤 <b>User:</b> ${phone || 'Guest'}\n🕒 <b>Status:</b> Waiting for agent.`);
-    res.json({ success: true });
-});
-
-// 2. Receive message from Website -> Send to Telegram
-app.post('/api/chat/send', async (req, res) => {
-    const { chatId, text, phone } = req.body;
-    
-    if (!activeChats[chatId]) activeChats[chatId] = [];
-    activeChats[chatId].push({ sender: 'user', text });
-
-    // Format the message with the ID so we can parse it when you reply
-    const tgMessage = `💬 <b>New Message</b>\n👤 <b>User:</b> ${phone || 'Guest'}\n🔑 <b>ID:</b> ${chatId}\n\n${text}`;
-    
-    try {
-        await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
-            chat_id: TELEGRAM_CHAT_ID,
-            text: tgMessage,
-            parse_mode: 'HTML'
-        });
-        res.json({ success: true });
-    } catch (e) {
-        res.status(500).json({ success: false, message: 'Telegram failed' });
-    }
-});
-
-// 3. Website polls this endpoint to get Admin replies
-app.get('/api/chat/sync', (req, res) => {
-    const { chatId } = req.query;
-    const messages = activeChats[chatId] || [];
-    res.json({ success: true, messages });
-});
-
-// 4. Catch your replies from Telegram -> Route to Website
-app.post('/api/telegram/webhook', (req, res) => {
-    res.sendStatus(200); // Always acknowledge Telegram immediately
-    
-    try {
-        const message = req.body.message;
-        // Check if you are replying to a message
-        if (!message || !message.reply_to_message || !message.text) return;
-
-        // Find the Chat ID in the original message you replied to
-        const originalText = message.reply_to_message.text;
-        const match = originalText.match(/ID:\s*([^\n]+)/);
-        
-        if (match && match[1]) {
-            const chatId = match[1].trim();
-            if (!activeChats[chatId]) activeChats[chatId] = [];
-            
-            // Save your reply so the user's website can pull it
-            activeChats[chatId].push({ sender: 'admin', text: message.text });
-        }
-    } catch(e) {
-        console.error("Webhook processing error:", e);
-    }
-});
-
-
 // ==========================================
 // START SERVER
 // ==========================================
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-    console.log(`🚀 ApexBet Server live on port ${PORT}`);
+server.listen(PORT, () => {
+    console.log(`🚀 ApexBet Socket Server live on port ${PORT}`);
 });
