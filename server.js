@@ -33,7 +33,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const MONGO_URI = process.env.MONGO_URI;
-const ODDS_API_KEY = process.env.ODDS_API_KEY; // 🟢 FIXED: Required for the games endpoint
+const ODDS_API_KEY = process.env.ODDS_API_KEY; 
 
 // ==========================================
 // REAL-TIME SOCKET HANDLER
@@ -92,6 +92,8 @@ const userSchema = new mongoose.Schema({
     password: { type: String, required: true }, 
     name: { type: String, required: true },
     balance: { type: Number, default: 0 },
+    bonusBalance: { type: Number, default: 0 }, // 🟢 NEW: Non-withdrawable bonus wallet
+    referredBy: { type: String, default: null }, // 🟢 NEW: Tracks who invited them
     createdAt: { type: Date, default: Date.now }
 });
 const User = mongoose.model('User', userSchema);
@@ -128,24 +130,44 @@ const LiveGame = mongoose.model('LiveGame', liveGameSchema);
 
 
 // ==========================================
-// AUTHENTICATION ENDPOINTS
+// AUTHENTICATION & REFERRAL ENDPOINTS
 // ==========================================
 app.post('/api/register', async (req, res) => {
     try {
-        const { phone, password, name } = req.body;
+        const { phone, password, name, ref } = req.body;
         if (!phone || !password) return res.status(400).json({ success: false, message: 'Phone and password are required.' });
 
         const existingUser = await User.findOne({ phone });
         if (existingUser) return res.status(400).json({ success: false, message: 'Phone number already registered. Please login.' });
 
+        // 🟢 Check if they used a referral link
+        let referredByPhone = null;
+        if (ref) {
+            const cleanRef = ref.replace('APX-', '');
+            // Find the referrer by decoding the Base64 representation matching the frontend
+            const allUsers = await User.find({});
+            const referrer = allUsers.find(u => Buffer.from(u.phone).toString('base64').substring(0, 8).toUpperCase() === cleanRef);
+            if (referrer) {
+                referredByPhone = referrer.phone;
+            }
+        }
+
         const salt = await bcrypt.genSalt(10);
         const hashedPassword = await bcrypt.hash(password, salt);
 
-        const newUser = new User({ phone, password: hashedPassword, name: name || 'New Player', balance: 0 });
+        const newUser = new User({ 
+            phone, 
+            password: hashedPassword, 
+            name: name || 'New Player', 
+            balance: 0, 
+            bonusBalance: 0,
+            referredBy: referredByPhone // Assign referrer
+        });
         await newUser.save();
 
-        sendTelegramMessage(`🚨 <b>NEW USER REGISTRATION</b> 🚨\n\n👤 <b>Name:</b> ${newUser.name}\n📱 <b>Phone:</b> ${newUser.phone}`);
-        res.json({ success: true, user: { name: newUser.name, balance: newUser.balance, phone: newUser.phone } });
+        sendTelegramMessage(`🚨 <b>NEW USER REGISTRATION</b> 🚨\n\n👤 <b>Name:</b> ${newUser.name}\n📱 <b>Phone:</b> ${newUser.phone}\n🔗 <b>Referred By:</b> ${referredByPhone || 'None'}`);
+        
+        res.json({ success: true, user: { name: newUser.name, balance: newUser.balance, bonusBalance: newUser.bonusBalance, phone: newUser.phone } });
     } catch (error) {
         res.status(500).json({ success: false, message: 'Server error' });
     }
@@ -168,14 +190,14 @@ app.post('/api/login', async (req, res) => {
                 return res.status(401).json({ success: false, message: 'Invalid phone number or password' });
             }
         }
-        res.json({ success: true, user: { name: user.name, balance: user.balance, phone: user.phone } });
+        res.json({ success: true, user: { name: user.name, balance: user.balance, bonusBalance: user.bonusBalance || 0, phone: user.phone } });
     } catch (error) {
         res.status(500).json({ success: false, message: 'Server error' });
     }
 });
 
 // ==========================================
-// FINANCE: DEPOSIT & WITHDRAWAL
+// FINANCE: DEPOSIT, WITHDRAWAL & BONUS
 // ==========================================
 app.post('/api/deposit', async (req, res) => {
     try {
@@ -233,6 +255,7 @@ app.post('/api/megapay/webhook', async (req, res) => {
         const existingTx = await Transaction.findOne({ refId: receipt });
         if (existingTx) return;
 
+        // Add to main balance
         user.balance += amount;
         await user.save();
 
@@ -240,9 +263,31 @@ app.post('/api/megapay/webhook', async (req, res) => {
             refId: receipt, userPhone: user.phone, type: "deposit", method: "M-Pesa", amount: amount, status: "Success"
         });
 
-        // 🔔 REAL-TIME DEPOSIT ALERT
         sendPushNotification(user.phone, "Deposit Successful", `Your deposit of KES ${amount} has been credited.`, "deposit");
-        sendTelegramMessage(`✅ <b>DEPOSIT CONFIRMED</b> ✅\n\n👤 <b>User:</b> ${user.phone}\n💰 <b>Amount:</b> KES ${amount}\n🧾 <b>Receipt:</b> ${receipt}\n💵 <b>New Balance:</b> KES ${user.balance.toLocaleString()}`);
+        sendTelegramMessage(`✅ <b>DEPOSIT CONFIRMED</b> ✅\n\n👤 <b>User:</b> ${user.phone}\n💰 <b>Amount:</b> KES ${amount}\n🧾 <b>Receipt:</b> ${receipt}`);
+
+        // 🟢 REFERRAL BONUS SYSTEM: Credit Referrer 50 KES on EVERY successful deposit
+        if (user.referredBy) {
+            const referrer = await User.findOne({ phone: user.referredBy });
+            if (referrer) {
+                // Add 50 KES to the Referrer's NON-WITHDRAWABLE Bonus Balance
+                referrer.bonusBalance = (referrer.bonusBalance || 0) + 50;
+                await referrer.save();
+
+                await Transaction.create({
+                    refId: `REF-BONUS-${receipt}`,
+                    userPhone: referrer.phone,
+                    type: "bonus",
+                    method: "Referral Deposit Bonus",
+                    amount: 50,
+                    status: "Success"
+                });
+
+                // Ping the referrer live
+                sendPushNotification(referrer.phone, "Referral Bonus! 🎁", `Your friend made a deposit! KES 50 has been added to your Bonus Wallet.`, "bonus");
+            }
+        }
+
     } catch (err) { 
         console.error("Webhook Processing Error:", err); 
     }
@@ -253,7 +298,11 @@ app.post('/api/withdraw', async (req, res) => {
         const { userPhone, amount, method } = req.body;
         const user = await User.findOne({ phone: userPhone });
         if (!user) return res.status(404).json({ success: false, message: 'User not found' });
-        if (user.balance < amount) return res.status(400).json({ success: false, message: 'Insufficient funds for withdrawal.' });
+        
+        // 🟢 STRICT CHECK: Users CANNOT withdraw Bonus Balance
+        if (user.balance < amount) {
+            return res.status(400).json({ success: false, message: 'Insufficient withdrawable funds. (Bonus funds cannot be withdrawn directly).' });
+        }
 
         user.balance -= Number(amount);
         await user.save();
@@ -261,9 +310,8 @@ app.post('/api/withdraw', async (req, res) => {
         const refId = 'WD-' + Math.floor(100000 + Math.random() * 900000);
         await Transaction.create({ refId, userPhone, type: 'withdraw', method, amount: -Number(amount), status: 'Success' });
 
-        // 🔔 REAL-TIME WITHDRAW ALERT
         sendPushNotification(user.phone, "Withdrawal Sent", `KES ${amount} has been sent to your M-Pesa.`, "withdraw");
-        sendTelegramMessage(`💸 <b>WITHDRAWAL REQUEST</b> 💸\n\n👤 <b>User:</b> ${user.phone}\n💰 <b>Amount:</b> KES ${amount}\n🧾 <b>Ref:</b> ${refId}\n💵 <b>Remaining Balance:</b> KES ${user.balance.toLocaleString()}`);
+        sendTelegramMessage(`💸 <b>WITHDRAWAL REQUEST</b> 💸\n\n👤 <b>User:</b> ${user.phone}\n💰 <b>Amount:</b> KES ${amount}\n🧾 <b>Ref:</b> ${refId}`);
 
         res.json({ success: true, newBalance: user.balance, refId });
     } catch (error) {
@@ -275,7 +323,7 @@ app.get('/api/balance/:phone', async (req, res) => {
     try {
         const user = await User.findOne({ phone: req.params.phone });
         if (!user) return res.status(404).json({ success: false, message: 'User not found' });
-        res.json({ success: true, balance: user.balance });
+        res.json({ success: true, balance: user.balance, bonusBalance: user.bonusBalance || 0 });
     } catch (error) {
         res.status(500).json({ success: false, message: 'Server error fetching balance' });
     }
@@ -298,9 +346,22 @@ app.post('/api/place-bet', async (req, res) => {
         const { userPhone, stake, selections, potentialWin, betType } = req.body;
         const user = await User.findOne({ phone: userPhone });
 
-        if (!user || user.balance < stake) return res.status(400).json({ success: false, message: 'Insufficient funds! Please deposit.' });
+        const totalAvailable = user.balance + (user.bonusBalance || 0);
 
-        user.balance -= stake;
+        if (!user || totalAvailable < stake) {
+            return res.status(400).json({ success: false, message: 'Insufficient funds! Please deposit.' });
+        }
+
+        // 🟢 BETTING LOGIC: Consume Bonus Balance FIRST
+        let remainingStake = stake;
+        if (user.bonusBalance >= remainingStake) {
+            user.bonusBalance -= remainingStake; // Paid entirely with bonus
+            remainingStake = 0;
+        } else {
+            remainingStake -= user.bonusBalance; // Use up whatever bonus exists
+            user.bonusBalance = 0;
+            user.balance -= remainingStake; // Take the rest from real balance
+        }
         await user.save();
 
         const ticketId = 'TXN-' + Math.floor(Math.random() * 900000 + 100000);
@@ -309,7 +370,7 @@ app.post('/api/place-bet', async (req, res) => {
 
         await Transaction.create({ refId: ticketId, userPhone, type: 'bet', method: `${betType || 'Sports'} Bet`, amount: -stake });
 
-        res.json({ success: true, newBalance: user.balance, ticketId: newBet.ticketId });
+        res.json({ success: true, newBalance: user.balance, newBonus: user.bonusBalance, ticketId: newBet.ticketId });
     } catch (error) {
         res.status(500).json({ success: false, message: 'Bet placement failed' });
     }
@@ -338,12 +399,12 @@ app.post('/api/cashout', async (req, res) => {
         bet.status = 'Cashed Out';
         await bet.save();
 
+        // Cashouts and Winnings go to REAL BALANCE, converting bonus into withdrawable cash
         user.balance += amount;
         await user.save();
 
         await Transaction.create({ refId: `CO-${ticketId}`, userPhone, type: 'cashout', method: 'Cashout', amount: amount });
 
-        // 🔔 REAL-TIME CASHOUT ALERT
         sendPushNotification(user.phone, "Bet Cashed Out", `You successfully cashed out KES ${amount}.`, "cashout");
 
         res.json({ success: true, message: 'Cashout successful', newBalance: user.balance });
@@ -360,10 +421,8 @@ setInterval(async () => {
         const openBets = await Bet.find({ status: 'Open' });
         
         for (let bet of openBets) {
-            // 80% chance it stays open
             if (Math.random() > 0.20) continue; 
 
-            // 40% chance to win, 60% chance to lose
             const isWin = Math.random() < 0.40;
             
             bet.status = isWin ? 'Won' : 'Lost';
@@ -372,11 +431,11 @@ setInterval(async () => {
             if (isWin) {
                 const user = await User.findOne({ phone: bet.userPhone });
                 if (user) {
+                    // Winnings go to REAL BALANCE, allowing bonus funds to be converted to cash
                     user.balance += bet.potentialWin;
                     await user.save();
                     await Transaction.create({ refId: `WIN-${bet.ticketId}`, userPhone: user.phone, type: 'win', method: 'Bet Winnings', amount: bet.potentialWin });
                     
-                    // 🔔 REAL-TIME WIN ALERT
                     sendPushNotification(user.phone, "Bet Won! 🥳", `Ticket ${bet.ticketId} won! KES ${bet.potentialWin} added to your balance.`, "win");
                 }
             }
@@ -384,7 +443,7 @@ setInterval(async () => {
     } catch (error) { 
         console.error("Settlement Error:", error.message); 
     }
-}, 60 * 60 * 1000); // Runs every 60 minutes
+}, 60 * 60 * 1000); 
 
 // ==========================================
 // ADMIN ROUTES & PUSH ALERTS
@@ -428,7 +487,6 @@ app.delete('/api/admin/users/:phone', async (req, res) => {
     }
 });
 
-// Trigger a push alert from Admin Panel
 app.post('/api/admin/push-alert', (req, res) => {
     const { phone, title, message } = req.body;
     if(phone === 'ALL') {
@@ -464,7 +522,7 @@ app.delete('/api/games', async (req, res) => {
 });
 
 // ==========================================
-// TELEGRAM LIVE CHAT BRIDGE (TWO-WAY WEB-SOCKETS)
+// TELEGRAM LIVE CHAT BRIDGE
 // ==========================================
 const activeChats = {};
 
@@ -506,10 +564,8 @@ app.get('/api/chat/sync', (req, res) => {
     res.json({ success: true, messages: activeChats[chatId] || [] });
 });
 
-// Catch replies from Telegram -> Route to Website instantly via Socket
 app.post('/api/telegram/webhook', (req, res) => {
     res.sendStatus(200); 
-    
     try {
         const message = req.body.message;
         if (!message || !message.reply_to_message || !message.text) return;
@@ -521,18 +577,13 @@ app.post('/api/telegram/webhook', (req, res) => {
             const chatId = match[1].trim();
             if (!activeChats[chatId]) activeChats[chatId] = [];
             activeChats[chatId].push({ sender: 'admin', text: message.text });
-            
-            // Push via Socket instantly to the user's specific room
             io.to(chatId).emit('admin_reply', { sender: 'admin', text: message.text });
         }
-    } catch(e) {
-        console.error("Webhook processing error:", e);
-    }
+    } catch(e) {}
 });
 
-
 // ==========================================
-// UNIFIED GAMES ENDPOINT (PRO MULTI-FETCH CACHING)
+// UNIFIED GAMES ENDPOINT
 // ==========================================
 let cachedApiGames = [];
 let lastApiFetchTime = 0;
@@ -540,19 +591,17 @@ const API_CACHE_DURATION = 10 * 60 * 1000;
 
 app.get('/api/games', async (req, res) => {
     try {
-        // 1. ALWAYS load manually injected games from MongoDB
         const dbGamesRaw = await LiveGame.find({});
         let allGames = dbGamesRaw.map(g => g.toObject());
 
-        // 2. Safely check for Odds API key and load automatic games if available
         if (ODDS_API_KEY && ODDS_API_KEY !== 'undefined') {
             const now = Date.now();
             
             if (now - lastApiFetchTime > API_CACHE_DURATION || cachedApiGames.length === 0) {
                 try {
                     const [eplRes, ligaRes, upcomingRes] = await Promise.allSettled([
-                        axios.get(`https://api.the-odds-api.com/v4/sports/soccer_epl/odds/`, { params: { apiKey: ODDS_API_KEY, regions: 'eu,uk', markets: 'h2h,totals,btts', oddsFormat: 'decimal' } }),
-                        axios.get(`https://api.the-odds-api.com/v4/sports/soccer_spain_la_liga/odds/`, { params: { apiKey: ODDS_API_KEY, regions: 'eu,uk', markets: 'h2h,totals,btts', oddsFormat: 'decimal' } }),
+                        axios.get(`https://api.the-odds-api.com/v4/sports/soccer_epl/odds/`, { params: { apiKey: ODDS_API_KEY, regions: 'eu,uk', markets: 'h2h', oddsFormat: 'decimal' } }),
+                        axios.get(`https://api.the-odds-api.com/v4/sports/soccer_spain_la_liga/odds/`, { params: { apiKey: ODDS_API_KEY, regions: 'eu,uk', markets: 'h2h', oddsFormat: 'decimal' } }),
                         axios.get(`https://api.the-odds-api.com/v4/sports/upcoming/odds/`, { params: { apiKey: ODDS_API_KEY, regions: 'eu,uk', markets: 'h2h', oddsFormat: 'decimal' } })
                     ]);
 
@@ -567,8 +616,6 @@ app.get('/api/games', async (req, res) => {
 
                     cachedApiGames = uniqueGames.map(m => {
                         let h = "0.00", d = null, a = "0.00";
-                        let extra = { o25: "-", u25: "-", bY: "-", bN: "-", dc1x: "-", dc12: "-", dcx2: "-", dnb1: "-", dnb2: "-" };
-                        
                         if (m.bookmakers && m.bookmakers.length > 0) {
                             const markets = m.bookmakers[0].markets;
                             const h2h = markets.find(mk => mk.key === 'h2h');
@@ -576,87 +623,27 @@ app.get('/api/games', async (req, res) => {
                                 const outHome = h2h.outcomes.find(o => o.name === m.home_team);
                                 const outAway = h2h.outcomes.find(o => o.name === m.away_team);
                                 const outDraw = h2h.outcomes.find(o => o.name.toLowerCase() === 'draw');
-                                
                                 if(outHome) h = outHome.price.toFixed(2);
                                 if(outAway) a = outAway.price.toFixed(2);
                                 if(outDraw) d = outDraw.price.toFixed(2);
-
-                                if (h !== "0.00" && a !== "0.00") {
-                                    const p1 = 1 / parseFloat(h), p2 = 1 / parseFloat(a), pX = d ? (1 / parseFloat(d)) : 0;
-                                    if (d) {
-                                        extra.dc1x = (1 / (p1 + pX)).toFixed(2);
-                                        extra.dcx2 = (1 / (p2 + pX)).toFixed(2);
-                                        extra.dc12 = (1 / (p1 + p2)).toFixed(2);
-                                    }
-                                    extra.dnb1 = (1 / (p1 / (p1 + p2))).toFixed(2);
-                                    extra.dnb2 = (1 / (p2 / (p1 + p2))).toFixed(2);
-                                }
-                            }
-
-                            const totals = markets.find(mk => mk.key === 'totals');
-                            if (totals && totals.outcomes) {
-                                const over = totals.outcomes.find(o => o.name.toLowerCase() === 'over');
-                                const under = totals.outcomes.find(o => o.name.toLowerCase() === 'under');
-                                if (over) extra.o25 = over.price.toFixed(2);
-                                if (under) extra.u25 = under.price.toFixed(2);
-                            }
-
-                            const btts = markets.find(mk => mk.key === 'btts');
-                            if (btts && btts.outcomes) {
-                                const bY = btts.outcomes.find(o => o.name.toLowerCase() === 'yes');
-                                const bN = btts.outcomes.find(o => o.name.toLowerCase() === 'no');
-                                if (bY) extra.bY = bY.price.toFixed(2);
-                                if (bN) extra.bN = bN.price.toFixed(2);
                             }
                         }
-
-                        // TIME AND LIVE STATUS CALCULATION (Adapted for EAT / Kenyan Time)
-                        const matchTime = new Date(m.commence_time);
-                        const now = Date.now();
-                        const diffMins = Math.floor((now - matchTime.getTime()) / 60000);
-                        
-                        let status = "upcoming", min = null, hs = 0, as = 0;
-                        let timeStr = matchTime.toLocaleTimeString('en-GB', {hour: '2-digit', minute:'2-digit', timeZone: 'Africa/Nairobi'});
-
-                        const matchDateEAT = new Date(matchTime.toLocaleString('en-US', { timeZone: 'Africa/Nairobi' }));
-                        const nowDateEAT = new Date(new Date().toLocaleString('en-US', { timeZone: 'Africa/Nairobi' }));
-
-                        if (diffMins >= 0 && diffMins <= 110) {
-                            status = "live";
-                            timeStr = "Live";
-                            min = diffMins > 45 && diffMins < 60 ? "HT" : diffMins > 90 ? "90+" : diffMins.toString();
-                            hs = Math.floor(Math.random() * 3); 
-                            as = Math.floor(Math.random() * 3);
-                        } else if (matchDateEAT.getDate() === nowDateEAT.getDate() && matchDateEAT.getMonth() === nowDateEAT.getMonth()) {
-                            status = "today";
-                            timeStr = `Today, ${timeStr}`;
-                        } else {
-                            status = "upcoming";
-                            timeStr = `Tomorrow, ${timeStr}`;
-                        }
-
                         if(h === "0.00" || a === "0.00") return null;
 
                         return {
                             id: m.id, category: m.sport_title, league: m.sport_title, cc: 'INT',
                             home: m.home_team, away: m.away_team, odds: h, draw: d, away_odds: a,
-                            time: timeStr, status: status, min: min, hs: hs, as: as, extra: extra
+                            time: "Today", status: "today"
                         };
                     }).filter(game => game !== null);
 
                     lastApiFetchTime = now;
-                } catch (apiErr) {
-                    console.error("Odds API Integration Error:", apiErr.message);
-                }
+                } catch (apiErr) {}
             }
-            // 3. Merge DB games (injected) WITH API games
             allGames = [...allGames, ...cachedApiGames];
         }
-
-        // 4. Return all combined games!
         res.json({ success: true, games: allGames });
     } catch (error) {
-        console.error("Fetch Games Route Error:", error);
         res.status(500).json({ success: false, message: 'Failed to aggregate games' });
     }
 });
