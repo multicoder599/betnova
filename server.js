@@ -90,7 +90,8 @@ const Bet = mongoose.model('Bet', betSchema);
 const transactionSchema = new mongoose.Schema({
     refId: { type: String, required: true, unique: true }, 
     userPhone: { type: String, required: true },
-    type: { type: String, enum: ['deposit', 'withdraw', 'bet', 'bonus', 'win'], required: true },
+    // ADDED 'cashout' to the enum below so the DB accepts cashout transactions
+    type: { type: String, enum: ['deposit', 'withdraw', 'bet', 'bonus', 'win', 'cashout'], required: true },
     method: { type: String, required: true },
     amount: { type: Number, required: true }, 
     status: { type: String, enum: ['Pending', 'Success', 'Failed'], default: 'Success' },
@@ -290,7 +291,7 @@ app.get('/api/transactions/:phone', async (req, res) => {
 });
 
 // ==========================================
-// BETTING ENDPOINT
+// BETTING ENDPOINTS
 // ==========================================
 app.post('/api/place-bet', async (req, res) => {
     try {
@@ -323,6 +324,74 @@ app.get('/api/bets/:phone', async (req, res) => {
     }
 });
 
+// NEW: CASHOUT ENDPOINT
+app.post('/api/cashout', async (req, res) => {
+    try {
+        const { ticketId, userPhone, amount } = req.body;
+        
+        const bet = await Bet.findOne({ ticketId: ticketId, userPhone: userPhone });
+        if (!bet) return res.status(404).json({ success: false, message: 'Ticket not found.' });
+        if (bet.status !== 'Open') return res.status(400).json({ success: false, message: 'Ticket is already settled or cashed out.' });
+
+        const user = await User.findOne({ phone: userPhone });
+        if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
+
+        // Update Bet Status
+        bet.status = 'Cashed Out';
+        await bet.save();
+
+        // Add funds to user
+        user.balance += amount;
+        await user.save();
+
+        // Log Transaction
+        await Transaction.create({ refId: `CO-${ticketId}`, userPhone, type: 'cashout', method: 'Cashout', amount: amount });
+
+        res.json({ success: true, message: 'Cashout successful', newBalance: user.balance });
+    } catch (error) { 
+        res.status(500).json({ success: false, message: 'Server error processing cashout' }); 
+    }
+});
+
+// ==========================================
+// BACKGROUND BET SETTLEMENT SIMULATOR
+// ==========================================
+// This automatically runs every 60 minutes and settles games to generate history and winnings.
+setInterval(async () => {
+    try {
+        const openBets = await Bet.find({ status: 'Open' });
+        
+        for (let bet of openBets) {
+            // 80% chance it stays open to simulate waiting for a real game to finish
+            if (Math.random() > 0.20) continue; 
+
+            // If it finishes: 40% chance it wins, 60% chance it loses
+            const isWin = Math.random() < 0.40;
+            
+            bet.status = isWin ? 'Won' : 'Lost';
+            await bet.save();
+
+            // Payout user if they won
+            if (isWin) {
+                const user = await User.findOne({ phone: bet.userPhone });
+                if (user) {
+                    user.balance += bet.potentialWin;
+                    await user.save();
+                    
+                    await Transaction.create({ 
+                        refId: `WIN-${bet.ticketId}`, 
+                        userPhone: user.phone, 
+                        type: 'win', 
+                        method: 'Bet Winnings', 
+                        amount: bet.potentialWin 
+                    });
+                }
+            }
+        }
+    } catch (error) { 
+        console.error("Settlement Error:", error.message); 
+    }
+}, 60 * 60 * 1000); // Runs every 60 minutes
 
 // ==========================================
 // ADMIN ROUTES (MANAGE USERS, BALANCES, GAMES)
