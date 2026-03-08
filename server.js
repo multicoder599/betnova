@@ -15,9 +15,9 @@ const server = http.createServer(app); // Wrap express in HTTP server
 // CORS & SOCKET CONFIGURATION
 // ==========================================
 app.use(cors({
-    origin: "*", // 🟢 ALLOWS ALL CONNECTIONS (Localhost, files, any domain)
+    origin: "*", // 🟢 ALLOWS ALL CONNECTIONS
     methods: ['GET', 'POST', 'PUT', 'DELETE'],
-    credentials: false // Must be false when origin is "*"
+    credentials: false 
 }));
 
 const io = new Server(server, {
@@ -26,6 +26,14 @@ const io = new Server(server, {
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
+
+// ==========================================
+// ENVIRONMENT VARIABLES
+// ==========================================
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+const MONGO_URI = process.env.MONGO_URI;
+const ODDS_API_KEY = process.env.ODDS_API_KEY; // 🟢 FIXED: Required for the games endpoint
 
 // ==========================================
 // REAL-TIME SOCKET HANDLER
@@ -64,9 +72,6 @@ function sendPushNotification(phone, title, message, type) {
 // ==========================================
 // TELEGRAM BOT UTILITY
 // ==========================================
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
-
 function sendTelegramMessage(message) {
     if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
     
@@ -78,8 +83,6 @@ function sendTelegramMessage(message) {
 // ==========================================
 // MONGODB CONNECTION & MODELS
 // ==========================================
-const MONGO_URI = process.env.MONGO_URI;
-
 mongoose.connect(MONGO_URI)
   .then(() => console.log('✅ Connected to MongoDB successfully!'))
   .catch(err => console.error('❌ MongoDB connection error:', err));
@@ -537,10 +540,12 @@ const API_CACHE_DURATION = 10 * 60 * 1000;
 
 app.get('/api/games', async (req, res) => {
     try {
+        // 1. ALWAYS load manually injected games from MongoDB
         const dbGamesRaw = await LiveGame.find({});
         let allGames = dbGamesRaw.map(g => g.toObject());
 
-        if (ODDS_API_KEY) {
+        // 2. Safely check for Odds API key and load automatic games if available
+        if (ODDS_API_KEY && ODDS_API_KEY !== 'undefined') {
             const now = Date.now();
             
             if (now - lastApiFetchTime > API_CACHE_DURATION || cachedApiGames.length === 0) {
@@ -644,9 +649,11 @@ app.get('/api/games', async (req, res) => {
                     console.error("Odds API Integration Error:", apiErr.message);
                 }
             }
+            // 3. Merge DB games (injected) WITH API games
             allGames = [...allGames, ...cachedApiGames];
         }
 
+        // 4. Return all combined games!
         res.json({ success: true, games: allGames });
     } catch (error) {
         console.error("Fetch Games Route Error:", error);
