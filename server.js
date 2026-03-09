@@ -205,8 +205,8 @@ app.post('/api/deposit', async (req, res) => {
         const reference = "DEP" + Date.now();
 
         const payload = {
-            api_key: "MGPY26G5iWPw", 
-            email: "kanyingiwaitara@gmail.com", 
+            api_key: "MGPYymo9Zv6Z", 
+            email: "streetmaster878@gmail.com", 
             amount: amount, 
             msisdn: formattedPhone,
             callback_url: `${APP_URL}/api/megapay/webhook`,
