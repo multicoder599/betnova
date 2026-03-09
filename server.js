@@ -464,10 +464,28 @@ app.delete('/api/admin/users/:phone', async (req, res) => {
     } catch (error) { res.status(500).json({ success: false, message: 'Failed to delete user account' }); }
 });
 
-app.post('/api/admin/push-alert', (req, res) => {
-    const { phone, title, message } = req.body;
-    sendPushNotification(phone, title, message, 'admin_alert');
-    res.json({success: true, message: "Alert queued for user!"});
+// 🟢 FIXED: Server-Sent Events Push Alerts for 'ALL'
+app.post('/api/admin/push-alert', async (req, res) => {
+    try {
+        const { phone, title, message } = req.body;
+        
+        if (phone === 'ALL') {
+            // Broadcast immediately to ALL active connections
+            const notif = await Notification.create({ userPhone: 'ALL', title, message, type: 'admin_alert' });
+            const payload = JSON.stringify(notif);
+            
+            for (let clients of sseClients.values()) {
+                clients.forEach(client => client.write(`data: ${payload}\n\n`));
+            }
+        } else {
+            // Target a specific user
+            await sendPushNotification(phone, title, message, 'admin_alert');
+        }
+        
+        res.json({success: true, message: "Alert successfully dispatched!"});
+    } catch(e) {
+        res.status(500).json({success: false, message: e.message});
+    }
 });
 
 app.post('/api/games', async (req, res) => {
