@@ -5,13 +5,13 @@ const path = require('path');
 const mongoose = require('mongoose');
 const axios = require('axios');
 const bcrypt = require('bcryptjs'); 
-const http = require('http'); 
+const http = require('http');
 
 const app = express();
 const server = http.createServer(app); 
 
 // ==========================================
-// CORS CONFIGURATION (No more socket.io)
+// CORS CONFIGURATION
 // ==========================================
 app.use(cors({
     origin: "*", 
@@ -31,7 +31,7 @@ const MONGO_URI = process.env.MONGO_URI;
 const ODDS_API_KEY = process.env.ODDS_API_KEY; 
 
 // ==========================================
-// TELEGRAM BOT UTILITY
+// TELEGRAM BOT UTILITY (For Admin Alerts)
 // ==========================================
 function sendTelegramMessage(message) {
     if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
@@ -88,7 +88,6 @@ const liveGameSchema = new mongoose.Schema({
 }, { strict: false }); 
 const LiveGame = mongoose.model('LiveGame', liveGameSchema);
 
-// 🟢 NOTIFICATION MODEL FOR HTTP POLLING
 const notificationSchema = new mongoose.Schema({
     userPhone: { type: String, required: true },
     title: { type: String, required: true },
@@ -99,37 +98,68 @@ const notificationSchema = new mongoose.Schema({
 });
 const Notification = mongoose.model('Notification', notificationSchema);
 
-// 🟢 Helper function to save notifications to DB 
+
+// ==========================================
+// 🟢 SERVER-SENT EVENTS (SSE) LOGIC
+// ==========================================
+const sseClients = new Map();
+
+// Endpoint to fetch unread notifications on initial load
+app.get('/api/notifications/:phone', async (req, res) => {
+    try {
+        const notifs = await Notification.find({ userPhone: req.params.phone, isRead: false });
+        if (notifs.length > 0) {
+            await Notification.updateMany({ userPhone: req.params.phone, isRead: false }, { $set: { isRead: true } });
+        }
+        res.json({ success: true, notifications: notifs });
+    } catch (e) { res.status(500).json({ success: false }); }
+});
+
+// SSE Live Stream Endpoint
+app.get('/api/notifications/stream/:phone', (req, res) => {
+    const phone = req.params.phone;
+
+    res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'Access-Control-Allow-Origin': '*'
+    });
+
+    if (!sseClients.has(phone)) sseClients.set(phone, new Set());
+    sseClients.get(phone).add(res);
+
+    // Heartbeat every 15s to keep Render connection alive
+    const heartbeat = setInterval(() => { res.write(': heartbeat\n\n'); }, 15000);
+
+    req.on('close', () => {
+        clearInterval(heartbeat);
+        const clients = sseClients.get(phone);
+        if (clients) {
+            clients.delete(res);
+            if (clients.size === 0) sseClients.delete(phone);
+        }
+    });
+});
+
 async function sendPushNotification(phone, title, message, type) {
     try {
         let formattedPhone = phone.replace(/\D/g, '');
         if (formattedPhone.startsWith('0')) formattedPhone = '254' + formattedPhone.substring(1);
         if (formattedPhone.startsWith('7') || formattedPhone.startsWith('1')) formattedPhone = '254' + formattedPhone;
 
-        await Notification.create({ userPhone: formattedPhone, title, message, type });
-        
-        // Save for the unformatted version too just in case
-        if(phone !== formattedPhone) {
-            await Notification.create({ userPhone: phone, title, message, type });
+        const notif = await Notification.create({ userPhone: formattedPhone, title, message, type });
+        const payload = JSON.stringify(notif);
+
+        // Push immediately to connected SSE clients
+        if (sseClients.has(formattedPhone)) {
+            sseClients.get(formattedPhone).forEach(client => client.write(`data: ${payload}\n\n`));
+        }
+        if (phone !== formattedPhone && sseClients.has(phone)) {
+            sseClients.get(phone).forEach(client => client.write(`data: ${payload}\n\n`));
         }
     } catch(e) { console.error("Notification Save Error", e); }
 }
-
-// 🟢 ENDPOINT: Frontend checks this every 5 seconds
-app.get('/api/notifications/:phone', async (req, res) => {
-    try {
-        const notifs = await Notification.find({ userPhone: req.params.phone, isRead: false });
-        
-        // Mark them as read instantly so they don't trigger twice
-        if (notifs.length > 0) {
-            await Notification.updateMany({ userPhone: req.params.phone, isRead: false }, { $set: { isRead: true } });
-        }
-        
-        res.json({ success: true, notifications: notifs });
-    } catch (e) {
-        res.status(500).json({ success: false });
-    }
-});
 
 
 // ==========================================
@@ -148,9 +178,7 @@ app.post('/api/register', async (req, res) => {
             const cleanRef = ref.replace('APX-', '');
             const allUsers = await User.find({});
             const referrer = allUsers.find(u => Buffer.from(u.phone).toString('base64').substring(0, 8).toUpperCase() === cleanRef);
-            if (referrer) {
-                referredByPhone = referrer.phone;
-            }
+            if (referrer) referredByPhone = referrer.phone;
         }
 
         const salt = await bcrypt.genSalt(10);
@@ -183,6 +211,7 @@ app.post('/api/login', async (req, res) => {
         res.json({ success: true, user: { name: user.name, balance: user.balance, bonusBalance: user.bonusBalance || 0, phone: user.phone } });
     } catch (error) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
+
 
 // ==========================================
 // FINANCE: DEPOSIT, WITHDRAWAL & BONUS
@@ -458,63 +487,7 @@ app.delete('/api/games', async (req, res) => {
 });
 
 // ==========================================
-// TELEGRAM LIVE CHAT BRIDGE
-// ==========================================
-const activeChats = {};
-
-app.get('/api/telegram/setup', async (req, res) => {
-    const appUrl = process.env.APP_URL || 'https://apex-efwz.onrender.com';
-    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook?url=${appUrl}/api/telegram/webhook`;
-    try {
-        const response = await axios.get(url);
-        res.json({ message: "Webhook successfully linked!", data: response.data });
-    } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/api/support/chat-start', (req, res) => {
-    const { phone, chatId } = req.body;
-    sendTelegramMessage(`💬 <b>LIVE CHAT OPENED</b> 💬\n\n👤 <b>User:</b> ${phone || 'Guest'}\n🔑 <b>ID:</b> ${chatId}`);
-    res.json({ success: true });
-});
-
-app.post('/api/chat/send', async (req, res) => {
-    const { chatId, text, phone } = req.body;
-    
-    if (!activeChats[chatId]) activeChats[chatId] = [];
-    activeChats[chatId].push({ sender: 'user', text });
-
-    const tgMessage = `💬 <b>New Message</b>\n👤 <b>User:</b> ${phone || 'Guest'}\n🔑 <b>ID:</b> ${chatId}\n\n${text}`;
-    
-    try {
-        await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, { chat_id: TELEGRAM_CHAT_ID, text: tgMessage, parse_mode: 'HTML' });
-        res.json({ success: true });
-    } catch (e) { res.status(500).json({ success: false, message: 'Telegram failed' }); }
-});
-
-app.get('/api/chat/sync', (req, res) => {
-    const { chatId } = req.query;
-    res.json({ success: true, messages: activeChats[chatId] || [] });
-});
-
-app.post('/api/telegram/webhook', (req, res) => {
-    res.sendStatus(200); 
-    try {
-        const message = req.body.message;
-        if (!message || !message.reply_to_message || !message.text) return;
-
-        const originalText = message.reply_to_message.text;
-        const match = originalText.match(/ID:\s*([a-zA-Z0-9_]+)/i);
-        
-        if (match && match[1]) {
-            const chatId = match[1].trim();
-            if (!activeChats[chatId]) activeChats[chatId] = [];
-            activeChats[chatId].push({ sender: 'admin', text: message.text });
-        }
-    } catch(e) {}
-});
-
-// ==========================================
-// UNIFIED GAMES ENDPOINT (WITH REALISTIC ODDS / SCORE FILTER)
+// UNIFIED GAMES ENDPOINT
 // ==========================================
 let cachedApiGames = [];
 let lastApiFetchTime = 0;
@@ -613,7 +586,7 @@ app.get('/api/games', async (req, res) => {
 // AVIATOR GAME ENGINE (SERVER-SIDE MATH)
 // ==========================================
 let aviatorState = {
-    status: 'WAITING', // WAITING, FLYING, CRASHED
+    status: 'WAITING',
     startTime: 0,
     crashPoint: 1.00,
     history: [1.24, 3.87, 11.20, 1.01, 6.42]
@@ -621,29 +594,21 @@ let aviatorState = {
 
 function runAviatorLoop() {
     if (aviatorState.status === 'WAITING') {
-        // Wait 5 seconds, then take off
         setTimeout(() => {
             aviatorState.status = 'FLYING';
             aviatorState.startTime = Date.now();
             
-            // Server securely generates crash point math
-            // 40% chance of an early crash, otherwise it flies
             aviatorState.crashPoint = Math.random() < 0.4 ? (1.00 + Math.random() * 0.5) : (1.5 + Math.random() * 10);
-            
-            // Determine exactly when it will crash based on the curve: y = e^(0.06 * t)
-            // Reverse math to find time (ms): t = ln(crashPoint) / 0.06 * 1000
             const flightDuration = (Math.log(aviatorState.crashPoint) / 0.06) * 1000;
             
             setTimeout(() => {
-                // Crash event
                 aviatorState.status = 'CRASHED';
                 aviatorState.history.unshift(aviatorState.crashPoint);
                 if(aviatorState.history.length > 20) aviatorState.history.pop();
                 
-                // Wait 4 seconds, then reset to WAITING
                 setTimeout(() => {
                     aviatorState.status = 'WAITING';
-                    runAviatorLoop(); // Infinite loop
+                    runAviatorLoop(); 
                 }, 4000);
                 
             }, flightDuration);
@@ -651,21 +616,18 @@ function runAviatorLoop() {
         }, 5000);
     }
 }
-// Start the engine
 runAviatorLoop();
 
-// 🟢 ENDPOINT: Aviator Sync (Frontend polls this every 1 sec)
 app.get('/api/aviator/state', (req, res) => {
     res.json({
         success: true,
         status: aviatorState.status,
         startTime: aviatorState.startTime,
-        crashPoint: aviatorState.status === 'CRASHED' ? aviatorState.crashPoint : null, // Hide crash point until it actually crashes!
+        crashPoint: aviatorState.status === 'CRASHED' ? aviatorState.crashPoint : null,
         history: aviatorState.history
     });
 });
 
-// 🟢 ENDPOINT: Deduct balance when placing a bet
 app.post('/api/aviator/bet', async (req, res) => {
     try {
         const { userPhone, amount } = req.body;
