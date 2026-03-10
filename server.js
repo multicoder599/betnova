@@ -672,12 +672,23 @@ app.post('/api/aviator/bet', async (req, res) => {
             return res.json({ success: true, newBalance: user.balance });
         }
 
-        // 🟢 Standard Bet Placement
-        if (user.balance >= betAmt) {
-            user.balance -= betAmt;
-            await user.save();
-            const tId = `CRASH-BET-${Date.now()}`;
+        // 🟢 FIX: Standard Bet Placement utilizing Bonus Balance
+        const totalAvailable = user.balance + (user.bonusBalance || 0);
+
+        if (totalAvailable >= betAmt) {
+            let remainingStake = betAmt;
             
+            if (user.bonusBalance >= remainingStake) {
+                user.bonusBalance -= remainingStake; 
+            } else {
+                remainingStake -= user.bonusBalance; 
+                user.bonusBalance = 0;
+                user.balance -= remainingStake; 
+            }
+            
+            await user.save();
+            
+            const tId = `CRASH-BET-${Date.now()}`;
             await Transaction.create({ refId: tId, userPhone, type: 'bet', method: 'Crash Bet', amount: -betAmt });
             
             // Log Aviator to "My Bets"
@@ -693,7 +704,7 @@ app.post('/api/aviator/bet', async (req, res) => {
 
             res.json({ success: true, newBalance: user.balance });
         } else {
-            res.status(400).json({ success: false });
+            res.status(400).json({ success: false, message: "Insufficient Funds" });
         }
     } catch(e) { res.status(500).json({ success: false }); }
 });
