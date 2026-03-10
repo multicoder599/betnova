@@ -201,7 +201,7 @@ app.post('/api/deposit', async (req, res) => {
         if (formattedPhone.startsWith('0')) formattedPhone = '254' + formattedPhone.substring(1);
         if (formattedPhone.startsWith('7') || formattedPhone.startsWith('1')) formattedPhone = '254' + formattedPhone;
 
-        const APP_URL = process.env.APP_URL || 'https://megaodds.onrender.com';
+        const APP_URL = process.env.APP_URL || 'https://mega-ab5i.onrender.com';
         const reference = "DEP" + Date.now();
 
         const payload = {
