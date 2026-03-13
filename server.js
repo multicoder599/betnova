@@ -92,7 +92,7 @@ const liveGameSchema = new mongoose.Schema({
 }, { strict: false }); 
 const LiveGame = mongoose.model('LiveGame', liveGameSchema);
 
-// 🟢 NEW: Permanent Virtuals Result Logging Schema
+// 🟢 Permanent Virtuals Result Logging Schema
 const virtualResultSchema = new mongoose.Schema({
     season: Number,
     matchday: Number,
@@ -104,6 +104,16 @@ const virtualResultSchema = new mongoose.Schema({
     createdAt: { type: Date, default: Date.now }
 });
 const VirtualResult = mongoose.model('VirtualResult', virtualResultSchema);
+
+// 🟢 NEW: Fixed Match Results Schema
+const matchResultSchema = new mongoose.Schema({
+    matchName: { type: String, required: true, unique: true }, // e.g., "Arsenal vs Chelsea"
+    hs: { type: Number, required: true },
+    as: { type: Number, required: true },
+    status: { type: String, default: 'FINISHED' },
+    createdAt: { type: Date, default: Date.now }
+});
+const MatchResult = mongoose.model('MatchResult', matchResultSchema);
 
 
 // ==========================================
@@ -235,6 +245,7 @@ app.post('/api/change-password', async (req, res) => {
         res.status(500).json({ success: false, message: 'Server error.' });
     }
 });
+
 // ==========================================
 // FINANCE: DEPOSIT, WITHDRAWAL & BONUS
 // ==========================================
@@ -314,6 +325,7 @@ app.post('/api/megapay/webhook', async (req, res) => {
     } catch (err) { console.error("Webhook Processing Error:", err); }
 });
 
+// 🟢 NEW/UPDATED: Withdraw Route (Sets to Pending Approval for Pay.html handling)
 app.post('/api/withdraw', async (req, res) => {
     try {
         const { userPhone, amount, method } = req.body;
@@ -328,9 +340,9 @@ app.post('/api/withdraw', async (req, res) => {
         await user.save();
 
         const refId = 'WD-' + Math.floor(100000 + Math.random() * 900000);
-        await Transaction.create({ refId, userPhone, type: 'withdraw', method, amount: -Number(amount), status: 'Success' });
+        await Transaction.create({ refId, userPhone, type: 'withdraw', method, amount: -Number(amount), status: 'Pending Approval' });
 
-        sendPushNotification(user.phone, "Withdrawal Sent", `KES ${amount} has been sent to your M-Pesa.`, "withdraw");
+        sendPushNotification(user.phone, "Withdrawal Initiated", `Your request for KES ${amount} is pending clearance.`, "withdraw");
         sendTelegramMessage(`💸 <b>WITHDRAWAL REQUEST</b> 💸\n\n👤 <b>User:</b> ${user.phone}\n💰 <b>Amount:</b> KES ${amount}\n🧾 <b>Ref:</b> ${refId}`);
 
         res.json({ success: true, newBalance: user.balance, refId });
@@ -450,7 +462,7 @@ app.post('/api/cashout', async (req, res) => {
 });
 
 // ==========================================
-// 🟢 FAST BACKGROUND SPORTS BET SETTLEMENT
+// 🟢 REALISTIC SPORTS SETTLEMENT ENGINE
 // ==========================================
 setInterval(async () => {
     try {
@@ -458,39 +470,96 @@ setInterval(async () => {
         const openBets = await Bet.find({ status: 'Open', type: { $nin: ['Aviator', 'Virtuals'] } });
         
         for (let bet of openBets) {
-            const timeDiff = Date.now() - new Date(bet.createdAt).getTime();
-            if (timeDiff < 2 * 60 * 1000) continue; 
-
-            // 40% chance to Win for testing
-            const isWin = Math.random() < 0.40; 
+            // Check age of the bet. 
+            // Realistic settlement: Average game takes ~115 minutes (90 + 15 HT + 10 stoppage).
+            const betAgeInMinutes = (Date.now() - new Date(bet.createdAt).getTime()) / 60000;
             
-            bet.status = isWin ? 'Won' : 'Lost';
-            await bet.save();
+            // Only process bets older than 115 minutes to simulate a full game duration
+            if (betAgeInMinutes < 115) continue;
 
-            if (isWin) {
-                const user = await User.findOne({ phone: bet.userPhone });
-                if (user) {
-                    user.balance += bet.potentialWin;
-                    await user.save();
+            let allFinished = true;
+            let allWon = true;
+
+            for (let sel of bet.selections) {
+                // 1. Check if Admin injected a FIXED result for this exact match
+                const fixedRes = await MatchResult.findOne({ matchName: sel.match });
+                
+                let hs, as, isFinished = false;
+
+                if (fixedRes) {
+                    hs = fixedRes.hs;
+                    as = fixedRes.as;
+                    isFinished = true;
+                } else {
+                    // 2. Fallback: If 115 minutes passed and no admin result, auto-simulate a realistic score
+                    // Favor home team slightly
+                    hs = Math.floor(Math.random() * 4); // 0 to 3 goals
+                    as = Math.floor(Math.random() * 3); // 0 to 2 goals
+                    isFinished = true;
                     
-                    await Transaction.create({ 
-                        refId: `WIN-${bet.ticketId}`, 
-                        userPhone: user.phone, 
-                        type: 'win', 
-                        method: 'Bet Winnings', 
-                        amount: bet.potentialWin 
-                    });
-                    
-                    sendPushNotification(user.phone, "Bet Won! 🥳", `Ticket ${bet.ticketId} won! KES ${bet.potentialWin} added to your balance.`, "win");
+                    // Save to DB so if other users bet on the same match, they get the exact same simulated score
+                    await MatchResult.create({ matchName: sel.match, hs, as, status: 'FINISHED' });
                 }
-            } else {
-                sendPushNotification(bet.userPhone, "Bet Lost 😔", `Ticket ${bet.ticketId} didn't go your way. Better luck next time!`, "bet");
+
+                if (!isFinished) {
+                    allFinished = false;
+                    break;
+                }
+
+                // 3. Evaluate the Pick based on the actual/simulated score
+                let wonSelection = false;
+                
+                if (sel.pick === '1' && hs > as) wonSelection = true;
+                else if (sel.pick === 'X' && hs === as) wonSelection = true;
+                else if (sel.pick === '2' && hs < as) wonSelection = true;
+                
+                else if (sel.pick === 'Over 2.5' && (hs+as) > 2) wonSelection = true;
+                else if (sel.pick === 'Under 2.5' && (hs+as) < 3) wonSelection = true;
+                else if (sel.pick === 'Over 1.5' && (hs+as) > 1) wonSelection = true;
+                else if (sel.pick === 'Under 1.5' && (hs+as) < 2) wonSelection = true;
+                
+                else if (sel.pick === 'GG' && hs > 0 && as > 0) wonSelection = true;
+                else if (sel.pick === 'NG' && (hs === 0 || as === 0)) wonSelection = true;
+                
+                else if (sel.pick === '1X' && hs >= as) wonSelection = true;
+                else if (sel.pick === 'X2' && hs <= as) wonSelection = true;
+                else if (sel.pick === '12' && hs !== as) wonSelection = true;
+
+                if (!wonSelection) {
+                    allWon = false; // Even one wrong pick ruins an accumulator/parlay
+                }
+            }
+
+            if (allFinished) {
+                bet.status = allWon ? 'Won' : 'Lost';
+                await bet.save();
+
+                if (allWon) {
+                    const user = await User.findOne({ phone: bet.userPhone });
+                    if (user) {
+                        user.balance += bet.potentialWin;
+                        await user.save();
+                        
+                        await Transaction.create({ 
+                            refId: `WIN-${bet.ticketId}`, 
+                            userPhone: user.phone, 
+                            type: 'win', 
+                            method: 'Bet Winnings', 
+                            amount: bet.potentialWin 
+                        });
+                        
+                        sendPushNotification(user.phone, "Bet Won! 🥳", `Ticket ${bet.ticketId} won! KES ${bet.potentialWin} added to your balance.`, "win");
+                    }
+                } else {
+                    sendPushNotification(bet.userPhone, "Bet Lost 😔", `Ticket ${bet.ticketId} didn't go your way. Better luck next time!`, "bet");
+                }
             }
         }
     } catch (error) { 
         console.error("Settlement Error:", error.message); 
     }
-}, 60 * 1000);
+}, 60 * 1000); // Check every 1 minute
+
 
 // ==========================================
 // ADMIN ROUTES & PUSH ALERTS
@@ -537,6 +606,25 @@ app.post('/api/admin/push-alert', async (req, res) => {
         }
         res.json({success: true, message: "Alert successfully dispatched!"});
     } catch(e) { res.status(500).json({success: false, message: e.message}); }
+});
+
+// 🟢 NEW: FIXED MATCH RESULTS INJECTION
+app.post('/api/admin/match-results', async (req, res) => {
+    try {
+        const { results } = req.body; 
+        // Expected format: { results: [ { matchName: "Arsenal vs Chelsea", hs: 2, as: 1 } ] }
+
+        for(let r of results) {
+            await MatchResult.findOneAndUpdate(
+                { matchName: r.matchName },
+                { hs: r.hs, as: r.as, status: 'FINISHED', createdAt: Date.now() },
+                { upsert: true, new: true }
+            );
+        }
+        res.json({ success: true, message: 'Fixed results injected successfully. Dependent bets will be settled in the next cycle.' });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
 });
 
 app.post('/api/games', async (req, res) => {
