@@ -200,7 +200,41 @@ app.post('/api/login', async (req, res) => {
     } catch (error) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
+// ==========================================
+// CHANGE PASSWORD
+// ==========================================
+app.post('/api/change-password', async (req, res) => {
+    try {
+        const { userPhone, currentPassword, newPassword } = req.body;
 
+        if (!userPhone || !currentPassword || !newPassword)
+            return res.status(400).json({ success: false, message: 'All fields are required.' });
+
+        if (newPassword.length < 8)
+            return res.status(400).json({ success: false, message: 'New password must be at least 8 characters.' });
+
+        const user = await User.findOne({ phone: userPhone });
+        if (!user)
+            return res.status(404).json({ success: false, message: 'User not found.' });
+
+        // Verify current password (supports both hashed & legacy plain-text)
+        const isMatch = await bcrypt.compare(currentPassword, user.password)
+            || currentPassword === user.password;
+
+        if (!isMatch)
+            return res.status(401).json({ success: false, message: 'Current password is incorrect.' });
+
+        const salt = await bcrypt.genSalt(10);
+        user.password = await bcrypt.hash(newPassword, salt);
+        await user.save();
+
+        sendTelegramMessage(`🔐 <b>PASSWORD CHANGED</b>\n\n📱 <b>Phone:</b> ${userPhone}`);
+
+        res.json({ success: true, message: 'Password updated successfully.' });
+    } catch (error) {
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
 // ==========================================
 // FINANCE: DEPOSIT, WITHDRAWAL & BONUS
 // ==========================================
