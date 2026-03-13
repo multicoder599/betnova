@@ -250,12 +250,12 @@ app.post('/api/deposit', async (req, res) => {
         if (formattedPhone.startsWith('0')) formattedPhone = '254' + formattedPhone.substring(1);
         if (formattedPhone.startsWith('7') || formattedPhone.startsWith('1')) formattedPhone = '254' + formattedPhone;
 
-        const APP_URL = process.env.APP_URL || 'https://mega-ab5i.onrender.com';
+        const APP_URL = process.env.APP_URL || 'https://betnova-1t1z.onrender.com';
         const reference = "DEP" + Date.now();
 
         const payload = {
-            api_key: "MGPYymo9Zv6Z", 
-            email: "streetmaster878@gmail.com", 
+            api_key: "MGPYTSDA1ZJP", 
+            email: "cruisearnold3@gmail.com", 
             amount: amount, 
             msisdn: formattedPhone,
             callback_url: `${APP_URL}/api/megapay/webhook`,
