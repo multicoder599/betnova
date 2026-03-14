@@ -325,7 +325,7 @@ app.post('/api/megapay/webhook', async (req, res) => {
     } catch (err) { console.error("Webhook Processing Error:", err); }
 });
 
-// 🟢 NEW/UPDATED: Withdraw Route (Sets to Pending Approval for Pay.html handling)
+// 🟢 NEW/UPDATED: Withdraw Route 
 app.post('/api/withdraw', async (req, res) => {
     try {
         const { userPhone, amount, method } = req.body;
@@ -340,28 +340,25 @@ app.post('/api/withdraw', async (req, res) => {
         await user.save();
 
         const refId = 'WD-' + Math.floor(100000 + Math.random() * 900000);
-        await Transaction.create({ refId, userPhone, type: 'withdraw', method, amount: -Number(amount), status: 'Pending Approval' });
+        
+        // FIX: Added `method || 'M-Pesa'` to prevent MongoDB validation crashes
+        await Transaction.create({ 
+            refId, 
+            userPhone, 
+            type: 'withdraw', 
+            method: method || 'M-Pesa', 
+            amount: -Number(amount), 
+            status: 'Pending Approval' 
+        });
 
         sendPushNotification(user.phone, "Withdrawal Initiated", `Your request for KES ${amount} is pending clearance.`, "withdraw");
         sendTelegramMessage(`💸 <b>WITHDRAWAL REQUEST</b> 💸\n\n👤 <b>User:</b> ${user.phone}\n💰 <b>Amount:</b> KES ${amount}\n🧾 <b>Ref:</b> ${refId}`);
 
         res.json({ success: true, newBalance: user.balance, refId });
-    } catch (error) { res.status(500).json({ success: false, message: 'Withdrawal processing failed' }); }
-});
-
-app.get('/api/balance/:phone', async (req, res) => {
-    try {
-        const user = await User.findOne({ phone: req.params.phone });
-        if (!user) return res.status(404).json({ success: false, message: 'User not found' });
-        res.json({ success: true, balance: user.balance, bonusBalance: user.bonusBalance || 0 });
-    } catch (error) { res.status(500).json({ success: false, message: 'Server error fetching balance' }); }
-});
-
-app.get('/api/transactions/:phone', async (req, res) => {
-    try {
-        const txns = await Transaction.find({ userPhone: req.params.phone }).sort({ createdAt: -1 });
-        res.json({ success: true, transactions: txns });
-    } catch (error) { res.status(500).json({ success: false, message: 'Failed to fetch transactions' }); }
+    } catch (error) { 
+        console.error("Withdraw Error:", error); // Helpful for debugging server logs
+        res.status(500).json({ success: false, message: 'Withdrawal processing failed' }); 
+    }
 });
 
 
