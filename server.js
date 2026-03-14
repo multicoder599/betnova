@@ -245,7 +245,29 @@ app.post('/api/change-password', async (req, res) => {
         res.status(500).json({ success: false, message: 'Server error.' });
     }
 });
+// ==========================================
+// BALANCE & TRANSACTIONS ENDPOINTS
+// ==========================================
+app.get('/api/balance/:phone', async (req, res) => {
+    try {
+        const user = await User.findOne({ phone: req.params.phone }).select('balance bonusBalance');
+        if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+        res.json({ success: true, balance: user.balance, bonusBalance: user.bonusBalance || 0 });
+    } catch (e) {
+        res.status(500).json({ success: false, message: 'Server error' });
+    }
+});
 
+app.get('/api/transactions/:phone', async (req, res) => {
+    try {
+        const transactions = await Transaction.find({ userPhone: req.params.phone })
+            .sort({ createdAt: -1 })
+            .limit(50);
+        res.json({ success: true, transactions });
+    } catch (e) {
+        res.status(500).json({ success: false, message: 'Server error' });
+    }
+});
 // ==========================================
 // FINANCE: DEPOSIT, WITHDRAWAL & BONUS
 // ==========================================
