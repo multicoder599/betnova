@@ -105,7 +105,7 @@ const virtualResultSchema = new mongoose.Schema({
 });
 const VirtualResult = mongoose.model('VirtualResult', virtualResultSchema);
 
-// 🟢 NEW: Fixed Match Results Schema
+// 🟢 Fixed Match Results Schema
 const matchResultSchema = new mongoose.Schema({
     matchName: { type: String, required: true, unique: true }, // e.g., "Arsenal vs Chelsea"
     hs: { type: Number, required: true },
@@ -245,6 +245,7 @@ app.post('/api/change-password', async (req, res) => {
         res.status(500).json({ success: false, message: 'Server error.' });
     }
 });
+
 // ==========================================
 // BALANCE & TRANSACTIONS ENDPOINTS
 // ==========================================
@@ -268,6 +269,7 @@ app.get('/api/transactions/:phone', async (req, res) => {
         res.status(500).json({ success: false, message: 'Server error' });
     }
 });
+
 // ==========================================
 // FINANCE: DEPOSIT, WITHDRAWAL & BONUS
 // ==========================================
@@ -347,7 +349,6 @@ app.post('/api/megapay/webhook', async (req, res) => {
     } catch (err) { console.error("Webhook Processing Error:", err); }
 });
 
-// 🟢 NEW/UPDATED: Withdraw Route 
 app.post('/api/withdraw', async (req, res) => {
     try {
         const { userPhone, amount, method } = req.body;
@@ -363,7 +364,6 @@ app.post('/api/withdraw', async (req, res) => {
 
         const refId = 'WD-' + Math.floor(100000 + Math.random() * 900000);
         
-        // FIX: Added `method || 'M-Pesa'` to prevent MongoDB validation crashes
         await Transaction.create({ 
             refId, 
             userPhone, 
@@ -378,7 +378,7 @@ app.post('/api/withdraw', async (req, res) => {
 
         res.json({ success: true, newBalance: user.balance, refId });
     } catch (error) { 
-        console.error("Withdraw Error:", error); // Helpful for debugging server logs
+        console.error("Withdraw Error:", error);
         res.status(500).json({ success: false, message: 'Withdrawal processing failed' }); 
     }
 });
@@ -664,7 +664,7 @@ app.delete('/api/games', async (req, res) => {
 
 
 // ==========================================
-// UNIFIED GAMES ENDPOINT (SPORTS)
+// 🟢 UNIFIED GAMES ENDPOINT (SPORTS API FETCHING)
 // ==========================================
 let cachedApiGames = [];
 let lastApiFetchTime = 0;
@@ -719,13 +719,24 @@ app.get('/api/games', async (req, res) => {
                         const diffMins = Math.floor((now - matchTime.getTime()) / 60000);
                         
                         let status = "upcoming", min = null, hs = 0, as = 0;
-                        let timeStr = matchTime.toLocaleTimeString('en-GB', {hour: '2-digit', minute:'2-digit', timeZone: 'Africa/Nairobi'});
+
+                        // 🟢 FORMAT DATE, DAY, AND TIME
+                        const options = { 
+                            timeZone: 'Africa/Nairobi', 
+                            weekday: 'short', 
+                            month: 'short', 
+                            day: 'numeric', 
+                            hour: '2-digit', 
+                            minute: '2-digit', 
+                            hour12: false 
+                        };
+                        // Results in: "Mon, 16 Mar, 14:30" -> replace commas to make it "Mon 16 Mar 14:30"
+                        let timeStr = new Intl.DateTimeFormat('en-GB', options).format(matchTime).replace(/,/g, '');
 
                         if (diffMins > 120) return null;
 
                         if (diffMins >= 0 && diffMins <= 115) {
                             status = "live";
-                            timeStr = "Live";
                             min = diffMins > 45 && diffMins < 60 ? "HT" : diffMins > 90 ? "90+" : diffMins.toString();
                             
                             const homeAdv = (1 / nH) > (1 / nA) ? 1.5 : 0.5;
@@ -734,7 +745,7 @@ app.get('/api/games', async (req, res) => {
                             
                         } else {
                             status = "upcoming";
-                            timeStr = `Upcoming, ${timeStr}`;
+                            timeStr = `${timeStr}`;
                         }
 
                         return {
@@ -775,12 +786,11 @@ let vStandings = V_TEAMS.map(t => ({ name: t.name, color: t.color, short: t.shor
 let vResultsHistory = [];
 let currentVSeason = 1;
 
-// Function to pre-calculate exact goal events to avoid loop throttling issues
 function generateVMatchEvents(homeProb) {
     let events = [];
     let hs = 0, as = 0;
     for(let min = 1; min <= 90; min++) {
-        if(Math.random() < 0.035) { // Goal frequency
+        if(Math.random() < 0.035) { 
             if(Math.random() < homeProb) { hs++; events.push({ min, type: 'home' }); }
             else { as++; events.push({ min, type: 'away' }); }
         }
@@ -841,9 +851,7 @@ function startNewVirtualSeason() {
     vResultsHistory = [];
 }
 
-// Start Season 1 on boot
 startNewVirtualSeason();
-
 let vRestartFlag = false;
 
 setInterval(async () => {
@@ -906,7 +914,6 @@ setInterval(async () => {
 
             // 2. SETTLE BETS IN DB
             try {
-                // Find bets for this specific round that are open
                 const pendingVBets = await Bet.find({ type: 'Virtuals', status: 'Open', 'selections.0.roundId': r.id });
                 
                 for (let b of pendingVBets) {
@@ -947,7 +954,7 @@ setInterval(async () => {
                 }
             } catch(e) { console.error("Virtual Settlement Error:", e); }
 
-            // 3. PERSIST MATCHES TO DB (Permanent Record)
+            // 3. PERSIST MATCHES TO DB 
             try {
                 const resultsToSave = r.matches.map(m => ({
                     season: currentVSeason,
@@ -1043,24 +1050,20 @@ app.post('/api/aviator/bet', async (req, res) => {
 
         const betAmt = Number(amount);
 
-        // 🟢 Refund Logic (User cancelled before takeoff)
+        // 🟢 Refund Logic
         if (betAmt < 0) {
             user.balance += Math.abs(betAmt);
             await user.save();
             await Transaction.create({ refId: `CRASH-REF-${Date.now()}`, userPhone, type: 'refund', method: 'Crash Refund', amount: Math.abs(betAmt) });
-            
-            // Delete the bet record so it doesn't show up in history
             await Bet.findOneAndDelete({ userPhone: userPhone, type: 'Aviator', status: 'Open' });
-            
             return res.json({ success: true, newBalance: user.balance });
         }
 
-        // 🟢 Standard Bet Placement utilizing Bonus Balance
+        // 🟢 Standard Bet Placement
         const totalAvailable = user.balance + (user.bonusBalance || 0);
 
         if (totalAvailable >= betAmt) {
             let remainingStake = betAmt;
-            
             if (user.bonusBalance >= remainingStake) {
                 user.bonusBalance -= remainingStake; 
             } else {
@@ -1074,7 +1077,6 @@ app.post('/api/aviator/bet', async (req, res) => {
             const tId = `CRASH-BET-${Date.now()}`;
             await Transaction.create({ refId: tId, userPhone, type: 'bet', method: 'Crash Bet', amount: -betAmt });
             
-            // Log Aviator to "My Bets"
             await Bet.create({
                 ticketId: tId,
                 userPhone: user.phone,
@@ -1085,16 +1087,13 @@ app.post('/api/aviator/bet', async (req, res) => {
                 selections: [{ match: "Crash Round", market: "Crash", pick: "Auto", odds: 1.0 }]
             });
 
-            // 🟢 SEND TELEGRAM NOTIFICATION TO ADMIN
             sendTelegramMessage(`✈️ <b>NEW AVIATOR BET</b> ✈️\n\n👤 <b>User:</b> ${userPhone}\n💸 <b>Stake:</b> KES ${betAmt}\n🎫 <b>Ticket:</b> ${tId}`);
-
             res.json({ success: true, newBalance: user.balance });
         } else {
             res.status(400).json({ success: false, message: "Insufficient Funds" });
         }
     } catch(e) { res.status(500).json({ success: false }); }
 });
-
 
 // ==========================================
 // START SERVER
