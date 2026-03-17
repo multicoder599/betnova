@@ -88,11 +88,11 @@ const Transaction = mongoose.model('Transaction', transactionSchema);
 const liveGameSchema = new mongoose.Schema({
     id: Number, category: String, home: String, away: String,
     odds: String, draw: String, away_odds: String, time: String,
-    status: { type: String, default: 'upcoming' }
+    status: { type: String, default: 'upcoming' },
+    commenceTime: { type: Date } // 🟢 Track exact API kickoff time
 }, { strict: false }); 
 const LiveGame = mongoose.model('LiveGame', liveGameSchema);
 
-// 🟢 Permanent Virtuals Result Logging Schema
 const virtualResultSchema = new mongoose.Schema({
     season: Number,
     matchday: Number,
@@ -105,7 +105,6 @@ const virtualResultSchema = new mongoose.Schema({
 });
 const VirtualResult = mongoose.model('VirtualResult', virtualResultSchema);
 
-// 🟢 Fixed Match Results Schema
 const matchResultSchema = new mongoose.Schema({
     matchName: { type: String, required: true, unique: true }, // e.g., "Arsenal vs Chelsea"
     hs: { type: Number, required: true },
@@ -480,6 +479,7 @@ app.post('/api/cashout', async (req, res) => {
     } catch (error) { res.status(500).json({ success: false, message: 'Server error processing cashout' }); }
 });
 
+
 // ==========================================
 // 🟢 REALISTIC SPORTS SETTLEMENT ENGINE
 // ==========================================
@@ -489,19 +489,12 @@ setInterval(async () => {
         const openBets = await Bet.find({ status: 'Open', type: { $nin: ['Aviator', 'Virtuals'] } });
         
         for (let bet of openBets) {
-            // Check age of the bet. 
-            // Realistic settlement: Average game takes ~115 minutes (90 + 15 HT + 10 stoppage).
-            const betAgeInMinutes = (Date.now() - new Date(bet.createdAt).getTime()) / 60000;
-            
-            // Only process bets older than 115 minutes to simulate a full game duration
-            if (betAgeInMinutes < 115) continue;
-
             let allFinished = true;
             let allWon = true;
 
             for (let sel of bet.selections) {
                 // 1. Check if Admin injected a FIXED result for this exact match
-                const fixedRes = await MatchResult.findOne({ matchName: sel.match });
+                let fixedRes = await MatchResult.findOne({ matchName: sel.match });
                 
                 let hs, as, isFinished = false;
 
@@ -510,14 +503,29 @@ setInterval(async () => {
                     as = fixedRes.as;
                     isFinished = true;
                 } else {
-                    // 2. Fallback: If 115 minutes passed and no admin result, auto-simulate a realistic score
-                    // Favor home team slightly
-                    hs = Math.floor(Math.random() * 4); // 0 to 3 goals
-                    as = Math.floor(Math.random() * 3); // 0 to 2 goals
-                    isFinished = true;
+                    // 2. Check if the game has naturally finished based on START TIME
+                    let matchStartTime = bet.createdAt; // Fallback to bet placement time
                     
-                    // Save to DB so if other users bet on the same match, they get the exact same simulated score
-                    await MatchResult.create({ matchName: sel.match, hs, as, status: 'FINISHED' });
+                    // Try to find the exact start time from LiveGame DB
+                    // sel.match is usually formatted like "Home vs Away"
+                    const teams = sel.match.split(' vs ');
+                    if (teams.length === 2) {
+                        const game = await LiveGame.findOne({ home: teams[0].trim(), away: teams[1].trim() });
+                        if (game && game.commenceTime) {
+                            matchStartTime = game.commenceTime;
+                        }
+                    }
+
+                    // A soccer match takes ~115 minutes from kickoff
+                    const minutesSinceStart = (Date.now() - new Date(matchStartTime).getTime()) / 60000;
+                    
+                    if (minutesSinceStart >= 115) {
+                        isFinished = true;
+                        // Auto-simulate and save so everyone gets the same result
+                        hs = Math.floor(Math.random() * 4);
+                        as = Math.floor(Math.random() * 3);
+                        await MatchResult.create({ matchName: sel.match, hs, as, status: 'FINISHED' });
+                    }
                 }
 
                 if (!isFinished) {
@@ -631,8 +639,6 @@ app.post('/api/admin/push-alert', async (req, res) => {
 app.post('/api/admin/match-results', async (req, res) => {
     try {
         const { results } = req.body; 
-        // Expected format: { results: [ { matchName: "Arsenal vs Chelsea", hs: 2, as: 1 } ] }
-
         for(let r of results) {
             await MatchResult.findOneAndUpdate(
                 { matchName: r.matchName },
@@ -650,7 +656,14 @@ app.post('/api/games', async (req, res) => {
     try {
         const { games, mode } = req.body;
         if (mode === 'replace') await LiveGame.deleteMany({}); 
-        await LiveGame.insertMany(games); 
+        
+        // Make sure manual injections don't overwrite valid schema by casting commenceTime
+        const formattedGames = games.map(g => ({
+            ...g,
+            commenceTime: g.commenceTime ? new Date(g.commenceTime) : undefined
+        }));
+
+        await LiveGame.insertMany(formattedGames); 
         res.json({ success: true, message: "Games updated in database" });
     } catch (error) { res.status(500).json({ success: false, message: 'Failed to inject games' }); }
 });
@@ -720,7 +733,6 @@ app.get('/api/games', async (req, res) => {
                         
                         let status = "upcoming", min = null, hs = 0, as = 0;
 
-                        // 🟢 FORMAT DATE, DAY, AND TIME
                         const options = { 
                             timeZone: 'Africa/Nairobi', 
                             weekday: 'short', 
@@ -730,7 +742,6 @@ app.get('/api/games', async (req, res) => {
                             minute: '2-digit', 
                             hour12: false 
                         };
-                        // Results in: "Mon, 16 Mar, 14:30" -> replace commas to make it "Mon 16 Mar 14:30"
                         let timeStr = new Intl.DateTimeFormat('en-GB', options).format(matchTime).replace(/,/g, '');
 
                         if (diffMins > 120) return null;
@@ -751,7 +762,8 @@ app.get('/api/games', async (req, res) => {
                         return {
                             id: m.id, category: m.sport_title, league: m.sport_title, cc: 'INT',
                             home: m.home_team, away: m.away_team, odds: h, draw: d, away_odds: a,
-                            time: timeStr, status: status, min: min, hs: hs, as: as
+                            time: timeStr, status: status, min: min, hs: hs, as: as,
+                            commenceTime: matchTime // 🟢 Store actual kickoff time
                         };
                     }).filter(game => game !== null);
 
