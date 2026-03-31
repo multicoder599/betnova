@@ -623,7 +623,21 @@ app.post('/api/admin/push-alert', async (req, res) => {
     } catch(e) { res.status(500).json({success: false, message: e.message}); }
 });
 
-// 🟢 FIXED MATCH RESULTS INJECTION
+// ==========================================
+// 🟢 FIXED MATCH RESULTS (CHEAT ENGINE)
+// ==========================================
+
+// 1. GET active fixed results for the admin panel
+app.get('/api/admin/match-results', async (req, res) => {
+    try {
+        const results = await MatchResult.find({}).sort({ createdAt: -1 });
+        res.json({ success: true, games: results });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// 2. INJECT a new fixed result
 app.post('/api/admin/match-results', async (req, res) => {
     try {
         const { results } = req.body; 
@@ -640,28 +654,15 @@ app.post('/api/admin/match-results', async (req, res) => {
     }
 });
 
-app.post('/api/games', async (req, res) => {
+// 3. DELETE all fixed results (Clear Overrides)
+app.delete('/api/admin/match-results', async (req, res) => {
     try {
-        const { games, mode } = req.body;
-        if (mode === 'replace') await LiveGame.deleteMany({}); 
-        
-        const formattedGames = games.map(g => ({
-            ...g,
-            commenceTime: g.commenceTime ? new Date(g.commenceTime) : undefined
-        }));
-
-        await LiveGame.insertMany(formattedGames); 
-        res.json({ success: true, message: "Games updated in database" });
-    } catch (error) { res.status(500).json({ success: false, message: 'Failed to inject games' }); }
+        await MatchResult.deleteMany({});
+        res.json({ success: true, message: 'All fixed overrides cleared.' });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
 });
-
-app.delete('/api/games', async (req, res) => {
-    try {
-        await LiveGame.deleteMany({});
-        res.json({ success: true, message: "Global database cleared" });
-    } catch (error) { res.status(500).json({ success: false, message: 'Failed to clear database' }); }
-});
-
 
 // ==========================================
 // 🟢 UNIFIED GAMES ENDPOINT (SPORTS API FETCHING)
