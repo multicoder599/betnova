@@ -624,7 +624,7 @@ app.post('/api/admin/push-alert', async (req, res) => {
 });
 
 // ==========================================
-// 🟢 FIXED MATCH RESULTS (CHEAT ENGINE)
+// 🟢 FIXED MATCH RESULTS INJECTION & API
 // ==========================================
 
 // 1. GET active fixed results for the admin panel
@@ -661,6 +661,39 @@ app.delete('/api/admin/match-results', async (req, res) => {
         res.json({ success: true, message: 'All fixed overrides cleared.' });
     } catch (error) {
         res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// ==========================================
+// 🟢 GAMES INJECTION & DELETION ROUTES
+// ==========================================
+
+// 4. POST new games to the database
+app.post('/api/games', async (req, res) => {
+    try {
+        const { games, mode } = req.body;
+        if (mode === 'replace') await LiveGame.deleteMany({}); 
+        
+        // Make sure manual injections don't overwrite valid schema by casting commenceTime
+        const formattedGames = games.map(g => ({
+            ...g,
+            commenceTime: g.commenceTime ? new Date(g.commenceTime) : undefined
+        }));
+
+        await LiveGame.insertMany(formattedGames); 
+        res.json({ success: true, message: "Games updated in database" });
+    } catch (error) { 
+        res.status(500).json({ success: false, message: 'Failed to inject games' }); 
+    }
+});
+
+// 5. DELETE all games from the database
+app.delete('/api/games', async (req, res) => {
+    try {
+        await LiveGame.deleteMany({});
+        res.json({ success: true, message: "Global database cleared" });
+    } catch (error) { 
+        res.status(500).json({ success: false, message: 'Failed to clear database' }); 
     }
 });
 
