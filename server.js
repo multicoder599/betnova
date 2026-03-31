@@ -89,7 +89,7 @@ const liveGameSchema = new mongoose.Schema({
     id: Number, category: String, home: String, away: String,
     odds: String, draw: String, away_odds: String, time: String,
     status: { type: String, default: 'upcoming' },
-    commenceTime: { type: Date } // 🟢 Track exact API kickoff time
+    commenceTime: { type: Date } // 🟢 Track exact kickoff time
 }, { strict: false }); 
 const LiveGame = mongoose.model('LiveGame', liveGameSchema);
 
@@ -105,6 +105,7 @@ const virtualResultSchema = new mongoose.Schema({
 });
 const VirtualResult = mongoose.model('VirtualResult', virtualResultSchema);
 
+// 🟢 Fixed Match Results Schema
 const matchResultSchema = new mongoose.Schema({
     matchName: { type: String, required: true, unique: true }, // e.g., "Arsenal vs Chelsea"
     hs: { type: Number, required: true },
@@ -184,7 +185,7 @@ app.post('/api/register', async (req, res) => {
         const newUser = new User({ phone, password: hashedPassword, name: name || 'New Player', balance: 0, bonusBalance: 0, referredBy: referredByPhone });
         await newUser.save();
 
-        sendTelegramMessage(`🚨 <b>NEW MEGAODDS REGISTRATION</b> 🚨\n\n👤 <b>Name:</b> ${newUser.name}\n📱 <b>Phone:</b> ${newUser.phone}\n🔗 <b>Referred By:</b> ${referredByPhone || 'None'}`);
+        sendTelegramMessage(`🚨 <b>NEW REGISTRATION</b> 🚨\n\n👤 <b>Name:</b> ${newUser.name}\n📱 <b>Phone:</b> ${newUser.phone}\n🔗 <b>Referred By:</b> ${referredByPhone || 'None'}`);
         res.json({ success: true, user: { name: newUser.name, balance: newUser.balance, bonusBalance: newUser.bonusBalance, phone: newUser.phone } });
     } catch (error) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
@@ -226,7 +227,6 @@ app.post('/api/change-password', async (req, res) => {
         if (!user)
             return res.status(404).json({ success: false, message: 'User not found.' });
 
-        // Verify current password (supports both hashed & legacy plain-text)
         const isMatch = await bcrypt.compare(currentPassword, user.password)
             || currentPassword === user.password;
 
@@ -270,7 +270,7 @@ app.get('/api/transactions/:phone', async (req, res) => {
 });
 
 // ==========================================
-// FINANCE: DEPOSIT, WITHDRAWAL & BONUS
+// FINANCE: DEPOSIT & WITHDRAWAL
 // ==========================================
 app.post('/api/deposit', async (req, res) => {
     try {
@@ -293,7 +293,7 @@ app.post('/api/deposit', async (req, res) => {
             amount: amount, 
             msisdn: formattedPhone,
             callback_url: `${APP_URL}/api/megapay/webhook`,
-            description: "MegaOdds Deposit", 
+            description: "Account Deposit", 
             reference: reference
         };
 
@@ -319,10 +319,7 @@ app.post('/api/megapay/webhook', async (req, res) => {
         let phone254 = rawPhone.startsWith('0') ? '254' + rawPhone.substring(1) : rawPhone;
 
         const user = await User.findOne({ $or: [{ phone: phone0 }, { phone: phone254 }, { phone: rawPhone }] });
-        if (!user) {
-            console.error(`Webhook user not found for phone: ${rawPhone}`);
-            return;
-        }
+        if (!user) return;
 
         const existingTx = await Transaction.findOne({ refId: receipt });
         if (existingTx) return;
@@ -348,6 +345,7 @@ app.post('/api/megapay/webhook', async (req, res) => {
     } catch (err) { console.error("Webhook Processing Error:", err); }
 });
 
+// 🟢 Withdraw Route (Sets to Pending Approval for Pay.html handling)
 app.post('/api/withdraw', async (req, res) => {
     try {
         const { userPhone, amount, method } = req.body;
@@ -377,17 +375,8 @@ app.post('/api/withdraw', async (req, res) => {
 
         res.json({ success: true, newBalance: user.balance, refId });
     } catch (error) { 
-        console.error("Withdraw Error:", error);
         res.status(500).json({ success: false, message: 'Withdrawal processing failed' }); 
     }
-});
-
-
-// ==========================================
-// PING TEST ENDPOINT
-// ==========================================
-app.get('/api/test', (req, res) => {
-    res.json({ success: true, message: "Server is awake!" });
 });
 
 
@@ -409,7 +398,6 @@ app.post('/api/place-bet', async (req, res) => {
             return res.status(400).json({ success: false, message: 'Insufficient funds! Please deposit.' });
         }
 
-        // Deduct from Bonus Balance first, then Main Balance
         let remainingStake = stake;
         if (user.bonusBalance >= remainingStake) {
             user.bonusBalance -= remainingStake; 
@@ -451,9 +439,7 @@ app.post('/api/cashout', async (req, res) => {
             user.balance += amount;
             await user.save();
             
-            // Mark Aviator bet as Cashed Out
             await Bet.updateOne({ ticketId: ticketId }, { $set: { status: 'Cashed Out' } });
-
             await Transaction.create({ refId: ticketId + '-WIN', userPhone, type: 'win', method: 'Crash Win', amount: amount });
             sendPushNotification(user.phone, "Crash Cashout! ✈️", `You successfully cashed out KES ${amount.toFixed(2)}.`, "cashout");
             
@@ -506,8 +492,6 @@ setInterval(async () => {
                     // 2. Check if the game has naturally finished based on START TIME
                     let matchStartTime = bet.createdAt; // Fallback to bet placement time
                     
-                    // Try to find the exact start time from LiveGame DB
-                    // sel.match is usually formatted like "Home vs Away"
                     const teams = sel.match.split(' vs ');
                     if (teams.length === 2) {
                         const game = await LiveGame.findOne({ home: teams[0].trim(), away: teams[1].trim() });
@@ -521,10 +505,14 @@ setInterval(async () => {
                     
                     if (minutesSinceStart >= 115) {
                         isFinished = true;
-                        // Auto-simulate and save so everyone gets the same result
-                        hs = Math.floor(Math.random() * 4);
-                        as = Math.floor(Math.random() * 3);
-                        await MatchResult.create({ matchName: sel.match, hs, as, status: 'FINISHED' });
+                        // Use $setOnInsert to prevent race conditions across multiple simultaneous tickets
+                        let newRes = await MatchResult.findOneAndUpdate(
+                            { matchName: sel.match },
+                            { $setOnInsert: { hs: Math.floor(Math.random() * 4), as: Math.floor(Math.random() * 3), status: 'FINISHED' } },
+                            { upsert: true, new: true }
+                        );
+                        hs = newRes.hs;
+                        as = newRes.as;
                     }
                 }
 
@@ -533,7 +521,7 @@ setInterval(async () => {
                     break;
                 }
 
-                // 3. Evaluate the Pick based on the actual/simulated score
+                // 3. Evaluate the Pick
                 let wonSelection = false;
                 
                 if (sel.pick === '1' && hs > as) wonSelection = true;
@@ -553,7 +541,7 @@ setInterval(async () => {
                 else if (sel.pick === '12' && hs !== as) wonSelection = true;
 
                 if (!wonSelection) {
-                    allWon = false; // Even one wrong pick ruins an accumulator/parlay
+                    allWon = false; // Even one wrong pick ruins an accumulator
                 }
             }
 
@@ -585,7 +573,7 @@ setInterval(async () => {
     } catch (error) { 
         console.error("Settlement Error:", error.message); 
     }
-}, 60 * 1000); // Check every 1 minute
+}, 60 * 1000);
 
 
 // ==========================================
@@ -635,7 +623,7 @@ app.post('/api/admin/push-alert', async (req, res) => {
     } catch(e) { res.status(500).json({success: false, message: e.message}); }
 });
 
-// 🟢 NEW: FIXED MATCH RESULTS INJECTION
+// 🟢 FIXED MATCH RESULTS INJECTION
 app.post('/api/admin/match-results', async (req, res) => {
     try {
         const { results } = req.body; 
@@ -657,7 +645,6 @@ app.post('/api/games', async (req, res) => {
         const { games, mode } = req.body;
         if (mode === 'replace') await LiveGame.deleteMany({}); 
         
-        // Make sure manual injections don't overwrite valid schema by casting commenceTime
         const formattedGames = games.map(g => ({
             ...g,
             commenceTime: g.commenceTime ? new Date(g.commenceTime) : undefined
@@ -688,6 +675,11 @@ app.get('/api/games', async (req, res) => {
         const dbGamesRaw = await LiveGame.find({});
         let allGames = dbGamesRaw.map(g => g.toObject());
 
+        // Fetch match results for FT display
+        const matchResults = await MatchResult.find({});
+        const resultsMap = new Map();
+        matchResults.forEach(r => resultsMap.set(r.matchName, r));
+
         if (ODDS_API_KEY && ODDS_API_KEY !== 'undefined') {
             const now = Date.now();
             
@@ -708,7 +700,7 @@ app.get('/api/games', async (req, res) => {
                     rawApiGames.forEach(g => { if (!uniqueGamesMap.has(g.id)) uniqueGamesMap.set(g.id, g); });
                     const uniqueGames = Array.from(uniqueGamesMap.values());
 
-                    cachedApiGames = uniqueGames.map(m => {
+                    cachedApiGames = await Promise.all(uniqueGames.map(async m => {
                         let h = "0.00", d = null, a = "0.00";
                         if (m.bookmakers && m.bookmakers.length > 0) {
                             const markets = m.bookmakers[0].markets;
@@ -730,48 +722,75 @@ app.get('/api/games', async (req, res) => {
 
                         const matchTime = new Date(m.commence_time);
                         const diffMins = Math.floor((now - matchTime.getTime()) / 60000);
+                        const matchName = `${m.home_team} vs ${m.away_team}`;
                         
                         let status = "upcoming", min = null, hs = 0, as = 0;
 
-                        const options = { 
-                            timeZone: 'Africa/Nairobi', 
-                            weekday: 'short', 
-                            month: 'short', 
-                            day: 'numeric', 
-                            hour: '2-digit', 
-                            minute: '2-digit', 
-                            hour12: false 
-                        };
+                        const options = { timeZone: 'Africa/Nairobi', weekday: 'short', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false };
                         let timeStr = new Intl.DateTimeFormat('en-GB', options).format(matchTime).replace(/,/g, '');
 
-                        if (diffMins > 120) return null;
+                        if (diffMins > 240) return null; // Remove from feed 4 hours after kickoff
 
-                        if (diffMins >= 0 && diffMins <= 115) {
+                        if (diffMins >= 115) {
+                            status = "finished";
+                            timeStr = "FT";
+                            if (resultsMap.has(matchName)) {
+                                hs = resultsMap.get(matchName).hs;
+                                as = resultsMap.get(matchName).as;
+                            } else {
+                                // Provide a fallback score so it doesn't look blank while waiting for settlement loop
+                                let newRes = await MatchResult.findOneAndUpdate(
+                                    { matchName },
+                                    { $setOnInsert: { hs: Math.floor(Math.random() * 4), as: Math.floor(Math.random() * 3), status: 'FINISHED' } },
+                                    { upsert: true, new: true }
+                                );
+                                hs = newRes.hs;
+                                as = newRes.as;
+                                resultsMap.set(matchName, newRes);
+                            }
+                        } else if (diffMins >= 0 && diffMins < 115) {
                             status = "live";
                             min = diffMins > 45 && diffMins < 60 ? "HT" : diffMins > 90 ? "90+" : diffMins.toString();
-                            
                             const homeAdv = (1 / nH) > (1 / nA) ? 1.5 : 0.5;
-                            hs = Math.floor((diffMins / 90) * homeAdv * Math.random() * 4);
-                            as = Math.floor((diffMins / 90) * (2 - homeAdv) * Math.random() * 4);
-                            
+                            hs = Math.floor((diffMins / 90) * homeAdv * 3);
+                            as = Math.floor((diffMins / 90) * (2 - homeAdv) * 2);
                         } else {
                             status = "upcoming";
-                            timeStr = `${timeStr}`;
                         }
 
                         return {
                             id: m.id, category: m.sport_title, league: m.sport_title, cc: 'INT',
                             home: m.home_team, away: m.away_team, odds: h, draw: d, away_odds: a,
                             time: timeStr, status: status, min: min, hs: hs, as: as,
-                            commenceTime: matchTime // 🟢 Store actual kickoff time
+                            commenceTime: matchTime 
                         };
-                    }).filter(game => game !== null);
+                    }));
 
                     lastApiFetchTime = now;
                 } catch (apiErr) {}
             }
+            
+            // Filter nulls from cached API
+            cachedApiGames = cachedApiGames.filter(g => g !== null);
             allGames = [...allGames, ...cachedApiGames];
         }
+
+        // Apply the same FT result mapping to manual DB games
+        allGames = allGames.map(g => {
+            const diffMins = g.commenceTime ? Math.floor((Date.now() - new Date(g.commenceTime).getTime()) / 60000) : 0;
+            const matchName = `${g.home} vs ${g.away}`;
+            
+            if (diffMins >= 115 || g.status === 'finished') {
+                g.status = 'finished';
+                g.time = 'FT';
+                if (resultsMap.has(matchName)) {
+                    g.hs = resultsMap.get(matchName).hs;
+                    g.as = resultsMap.get(matchName).as;
+                }
+            }
+            return g;
+        });
+
         res.json({ success: true, games: allGames });
     } catch (error) { res.status(500).json({ success: false, message: 'Failed to aggregate games' }); }
 });
