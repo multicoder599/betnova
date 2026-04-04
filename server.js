@@ -107,7 +107,7 @@ const VirtualResult = mongoose.model('VirtualResult', virtualResultSchema);
 
 // 🟢 Fixed Match Results Schema
 const matchResultSchema = new mongoose.Schema({
-    matchName: { type: String, required: true, unique: true }, // e.g., "Arsenal vs Chelsea"
+    matchName: { type: String, required: true, unique: true }, 
     hs: { type: Number, required: true },
     as: { type: Number, required: true },
     status: { type: String, default: 'FINISHED' },
@@ -345,7 +345,6 @@ app.post('/api/megapay/webhook', async (req, res) => {
     } catch (err) { console.error("Webhook Processing Error:", err); }
 });
 
-// 🟢 Withdraw Route (Sets to Pending Approval for Pay.html handling)
 app.post('/api/withdraw', async (req, res) => {
     try {
         const { userPhone, amount, method } = req.body;
@@ -375,6 +374,7 @@ app.post('/api/withdraw', async (req, res) => {
 
         res.json({ success: true, newBalance: user.balance, refId });
     } catch (error) { 
+        console.error("Withdraw Error:", error);
         res.status(500).json({ success: false, message: 'Withdrawal processing failed' }); 
     }
 });
@@ -471,7 +471,6 @@ app.post('/api/cashout', async (req, res) => {
 // ==========================================
 setInterval(async () => {
     try {
-        // Find all Open sports/jackpot bets
         const openBets = await Bet.find({ status: 'Open', type: { $nin: ['Aviator', 'Virtuals'] } });
         
         for (let bet of openBets) {
@@ -489,23 +488,25 @@ setInterval(async () => {
                     as = fixedRes.as;
                     isFinished = true;
                 } else {
-                    // 2. Check if the game has naturally finished based on START TIME
-                    let matchStartTime = bet.createdAt; // Fallback to bet placement time
+                    // 2. Fallback to extracting the Start Time
+                    let matchStartTime = new Date(bet.createdAt).getTime(); // Safe fallback
                     
                     const teams = sel.match.split(' vs ');
                     if (teams.length === 2) {
                         const game = await LiveGame.findOne({ home: teams[0].trim(), away: teams[1].trim() });
                         if (game && game.commenceTime) {
-                            matchStartTime = game.commenceTime;
+                            matchStartTime = new Date(game.commenceTime).getTime();
                         }
                     }
 
                     // A soccer match takes ~115 minutes from kickoff
-                    const minutesSinceStart = (Date.now() - new Date(matchStartTime).getTime()) / 60000;
+                    const minutesSinceStart = (Date.now() - matchStartTime) / 60000;
                     
+                    // 🟢 SECURE GATE: ONLY SETTLE IF 115 MINUTES HAVE ACTUALLY PASSED
                     if (minutesSinceStart >= 115) {
                         isFinished = true;
-                        // Use $setOnInsert to prevent race conditions across multiple simultaneous tickets
+                        
+                        // Use $setOnInsert to prevent race conditions
                         let newRes = await MatchResult.findOneAndUpdate(
                             { matchName: sel.match },
                             { $setOnInsert: { hs: Math.floor(Math.random() * 4), as: Math.floor(Math.random() * 3), status: 'FINISHED' } },
@@ -541,7 +542,7 @@ setInterval(async () => {
                 else if (sel.pick === '12' && hs !== as) wonSelection = true;
 
                 if (!wonSelection) {
-                    allWon = false; // Even one wrong pick ruins an accumulator
+                    allWon = false; // One wrong pick ruins the accumulator
                 }
             }
 
@@ -627,7 +628,6 @@ app.post('/api/admin/push-alert', async (req, res) => {
 // 🟢 FIXED MATCH RESULTS INJECTION & API
 // ==========================================
 
-// 1. GET active fixed results for the admin panel
 app.get('/api/admin/match-results', async (req, res) => {
     try {
         const results = await MatchResult.find({}).sort({ createdAt: -1 });
@@ -637,7 +637,6 @@ app.get('/api/admin/match-results', async (req, res) => {
     }
 });
 
-// 2. INJECT a new fixed result
 app.post('/api/admin/match-results', async (req, res) => {
     try {
         const { results } = req.body; 
@@ -654,7 +653,6 @@ app.post('/api/admin/match-results', async (req, res) => {
     }
 });
 
-// 3. DELETE all fixed results (Clear Overrides)
 app.delete('/api/admin/match-results', async (req, res) => {
     try {
         await MatchResult.deleteMany({});
@@ -668,13 +666,11 @@ app.delete('/api/admin/match-results', async (req, res) => {
 // 🟢 GAMES INJECTION & DELETION ROUTES
 // ==========================================
 
-// 4. POST new games to the database
 app.post('/api/games', async (req, res) => {
     try {
         const { games, mode } = req.body;
         if (mode === 'replace') await LiveGame.deleteMany({}); 
         
-        // Make sure manual injections don't overwrite valid schema by casting commenceTime
         const formattedGames = games.map(g => ({
             ...g,
             commenceTime: g.commenceTime ? new Date(g.commenceTime) : undefined
@@ -687,7 +683,6 @@ app.post('/api/games', async (req, res) => {
     }
 });
 
-// 5. DELETE all games from the database
 app.delete('/api/games', async (req, res) => {
     try {
         await LiveGame.deleteMany({});
@@ -709,7 +704,6 @@ app.get('/api/games', async (req, res) => {
         const dbGamesRaw = await LiveGame.find({});
         let allGames = dbGamesRaw.map(g => g.toObject());
 
-        // Fetch match results for FT display
         const matchResults = await MatchResult.find({});
         const resultsMap = new Map();
         matchResults.forEach(r => resultsMap.set(r.matchName, r));
@@ -772,7 +766,6 @@ app.get('/api/games', async (req, res) => {
                                 hs = resultsMap.get(matchName).hs;
                                 as = resultsMap.get(matchName).as;
                             } else {
-                                // Provide a fallback score so it doesn't look blank while waiting for settlement loop
                                 let newRes = await MatchResult.findOneAndUpdate(
                                     { matchName },
                                     { $setOnInsert: { hs: Math.floor(Math.random() * 4), as: Math.floor(Math.random() * 3), status: 'FINISHED' } },
@@ -804,12 +797,10 @@ app.get('/api/games', async (req, res) => {
                 } catch (apiErr) {}
             }
             
-            // Filter nulls from cached API
             cachedApiGames = cachedApiGames.filter(g => g !== null);
             allGames = [...allGames, ...cachedApiGames];
         }
 
-        // Apply the same FT result mapping to manual DB games
         allGames = allGames.map(g => {
             const diffMins = g.commenceTime ? Math.floor((Date.now() - new Date(g.commenceTime).getTime()) / 60000) : 0;
             const matchName = `${g.home} vs ${g.away}`;
