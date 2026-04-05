@@ -484,8 +484,30 @@ app.post('/api/place-bet', async (req, res) => {
 app.get('/api/bets/:phone', async (req, res) => {
     try {
         const bets = await Bet.find({ userPhone: req.params.phone }).sort({ createdAt: -1 });
-        res.json({ success: true, bets });
-    } catch (error) { res.status(500).json({ success: false, message: 'Failed to fetch betting history' }); }
+        
+        // 🟢 Fetch final scores for settled bets
+        const matchResults = await MatchResult.find({});
+        const resultsMap = new Map();
+        matchResults.forEach(r => resultsMap.set(r.matchName, `${r.hs}-${r.as}`));
+
+        // Attach the final scores to the bets before sending
+        const enrichedBets = bets.map(b => {
+            const betObj = b.toObject();
+            if (betObj.status !== 'Open' && betObj.type === 'Sports') {
+                betObj.selections = betObj.selections.map(sel => {
+                    if (resultsMap.has(sel.match)) {
+                        sel.finalScore = resultsMap.get(sel.match);
+                    }
+                    return sel;
+                });
+            }
+            return betObj;
+        });
+
+        res.json({ success: true, bets: enrichedBets });
+    } catch (error) { 
+        res.status(500).json({ success: false, message: 'Failed to fetch betting history' }); 
+    }
 });
 
 app.post('/api/cashout', async (req, res) => {
