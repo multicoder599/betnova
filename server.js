@@ -89,7 +89,7 @@ const liveGameSchema = new mongoose.Schema({
     id: Number, category: String, home: String, away: String,
     odds: String, draw: String, away_odds: String, time: String,
     status: { type: String, default: 'upcoming' },
-    commenceTime: { type: Date } // 🟢 Track exact kickoff time
+    commenceTime: { type: Date } 
 }, { strict: false }); 
 const LiveGame = mongoose.model('LiveGame', liveGameSchema);
 
@@ -105,7 +105,6 @@ const virtualResultSchema = new mongoose.Schema({
 });
 const VirtualResult = mongoose.model('VirtualResult', virtualResultSchema);
 
-// 🟢 Fixed Match Results Schema
 const matchResultSchema = new mongoose.Schema({
     matchName: { type: String, required: true, unique: true }, 
     hs: { type: Number, required: true },
@@ -115,6 +114,37 @@ const matchResultSchema = new mongoose.Schema({
 });
 const MatchResult = mongoose.model('MatchResult', matchResultSchema);
 
+// 🟢 NEW: Shared Betslip Schema (Booking Codes)
+const sharedBetslipSchema = new mongoose.Schema({
+    bookingCode: { type: String, required: true, unique: true },
+    selections: { type: Array, required: true },
+    createdAt: { type: Date, default: Date.now, expires: '48h' } 
+});
+const SharedBetslip = mongoose.model('SharedBetslip', sharedBetslipSchema);
+
+// 🟢 NEW: Admin Config Schema
+const adminConfigSchema = new mongoose.Schema({
+    id: { type: String, default: "global" },
+    aviatorWinChance: { type: Number, default: 30 },
+    virtualsMargin: { type: Number, default: 1.20 }
+});
+const AdminConfig = mongoose.model('AdminConfig', adminConfigSchema);
+
+// ==========================================
+// 🟢 GLOBAL CONFIG CACHE
+// ==========================================
+let globalConfig = { aviatorWinChance: 30, virtualsMargin: 1.20 };
+setInterval(async () => {
+    try {
+        let conf = await AdminConfig.findOne({ id: "global" });
+        if (conf) {
+            globalConfig.aviatorWinChance = conf.aviatorWinChance;
+            globalConfig.virtualsMargin = conf.virtualsMargin;
+        } else {
+            await AdminConfig.create({ id: "global" });
+        }
+    } catch(e) {}
+}, 15000); // Refreshes from DB every 15 seconds
 
 // ==========================================
 // 🟢 NOTIFICATIONS (EMBEDDED DB LOGIC)
@@ -379,6 +409,36 @@ app.post('/api/withdraw', async (req, res) => {
     }
 });
 
+// ==========================================
+// 🟢 BOOKING CODE ROUTES (SHARE BETSLIP)
+// ==========================================
+app.post('/api/share-betslip', async (req, res) => {
+    try {
+        const { selections } = req.body;
+        if (!selections || selections.length === 0) return res.status(400).json({ success: false });
+
+        const generateCode = () => Math.random().toString(36).substring(2, 7).toUpperCase();
+        let newCode = generateCode();
+        
+        while (await SharedBetslip.exists({ bookingCode: newCode })) {
+            newCode = generateCode();
+        }
+
+        await SharedBetslip.create({ bookingCode: newCode, selections });
+        res.json({ success: true, bookingCode: newCode });
+    } catch (error) { res.status(500).json({ success: false }); }
+});
+
+app.get('/api/load-betslip/:code', async (req, res) => {
+    try {
+        const code = req.params.code.toUpperCase();
+        const slip = await SharedBetslip.findOne({ bookingCode: code });
+        
+        if (!slip) return res.status(404).json({ success: false, message: 'Code not found or expired.' });
+        
+        res.json({ success: true, selections: slip.selections });
+    } catch (error) { res.status(500).json({ success: false }); }
+});
 
 // ==========================================
 // SPORTS BETTING ENDPOINTS
@@ -625,9 +685,33 @@ app.post('/api/admin/push-alert', async (req, res) => {
 });
 
 // ==========================================
+// 🟢 ADMIN CONFIG ROUTES
+// ==========================================
+app.get('/api/admin/config', async (req, res) => {
+    try {
+        let config = await AdminConfig.findOne({ id: "global" });
+        if (!config) config = await AdminConfig.create({ id: "global" });
+        res.json({ success: true, config });
+    } catch (error) { res.status(500).json({ success: false, message: error.message }); }
+});
+
+app.post('/api/admin/config', async (req, res) => {
+    try {
+        const { aviatorWinChance, virtualsMargin } = req.body;
+        let config = await AdminConfig.findOneAndUpdate(
+            { id: "global" },
+            { aviatorWinChance, virtualsMargin },
+            { upsert: true, new: true }
+        );
+        globalConfig.aviatorWinChance = aviatorWinChance;
+        globalConfig.virtualsMargin = virtualsMargin;
+        res.json({ success: true, config });
+    } catch (error) { res.status(500).json({ success: false, message: error.message }); }
+});
+
+// ==========================================
 // 🟢 FIXED MATCH RESULTS INJECTION & API
 // ==========================================
-
 app.get('/api/admin/match-results', async (req, res) => {
     try {
         const results = await MatchResult.find({}).sort({ createdAt: -1 });
@@ -665,7 +749,6 @@ app.delete('/api/admin/match-results', async (req, res) => {
 // ==========================================
 // 🟢 GAMES INJECTION & DELETION ROUTES
 // ==========================================
-
 app.post('/api/games', async (req, res) => {
     try {
         const { games, mode } = req.body;
@@ -866,7 +949,7 @@ function createVirtualRound(matchday, startTime) {
         let p2 = Math.random() * 0.35 + 0.15; 
         let px = Math.max(0.15, 1 - (p1 + p2)); 
         
-        const margin = 1.12; 
+        const margin = globalConfig.virtualsMargin || 1.12; 
         const hBase = (1 / (p1 * margin)).toFixed(2);
         const dBase = (1 / (px * margin)).toFixed(2);
         const aBase = (1 / (p2 * margin)).toFixed(2);
@@ -1065,7 +1148,11 @@ function runAviatorLoop() {
             aviatorState.status = 'FLYING';
             aviatorState.startTime = Date.now();
             
-            aviatorState.crashPoint = Math.random() < 0.4 ? (1.00 + Math.random() * 0.5) : (1.5 + Math.random() * 10);
+            const winChance = (globalConfig.aviatorWinChance || 30) / 100;
+            aviatorState.crashPoint = Math.random() < winChance 
+                ? (1.40 + Math.random() * 10) 
+                : (1.00 + Math.random() * 0.4);
+
             const flightDuration = (Math.log(aviatorState.crashPoint) / 0.06) * 1000;
             
             setTimeout(() => {
