@@ -114,7 +114,6 @@ const matchResultSchema = new mongoose.Schema({
 });
 const MatchResult = mongoose.model('MatchResult', matchResultSchema);
 
-// 🟢 NEW: Shared Betslip Schema (Booking Codes)
 const sharedBetslipSchema = new mongoose.Schema({
     bookingCode: { type: String, required: true, unique: true },
     selections: { type: Array, required: true },
@@ -122,7 +121,6 @@ const sharedBetslipSchema = new mongoose.Schema({
 });
 const SharedBetslip = mongoose.model('SharedBetslip', sharedBetslipSchema);
 
-// 🟢 NEW: Admin Config Schema
 const adminConfigSchema = new mongoose.Schema({
     id: { type: String, default: "global" },
     aviatorWinChance: { type: Number, default: 30 },
@@ -144,7 +142,7 @@ setInterval(async () => {
             await AdminConfig.create({ id: "global" });
         }
     } catch(e) {}
-}, 15000); // Refreshes from DB every 15 seconds
+}, 15000); 
 
 // ==========================================
 // 🟢 NOTIFICATIONS (EMBEDDED DB LOGIC)
@@ -240,9 +238,6 @@ app.post('/api/login', async (req, res) => {
     } catch (error) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
-// ==========================================
-// CHANGE PASSWORD
-// ==========================================
 app.post('/api/change-password', async (req, res) => {
     try {
         const { userPhone, currentPassword, newPassword } = req.body;
@@ -485,12 +480,10 @@ app.get('/api/bets/:phone', async (req, res) => {
     try {
         const bets = await Bet.find({ userPhone: req.params.phone }).sort({ createdAt: -1 });
         
-        // 🟢 Fetch final scores for settled bets
         const matchResults = await MatchResult.find({});
         const resultsMap = new Map();
         matchResults.forEach(r => resultsMap.set(r.matchName, `${r.hs}-${r.as}`));
 
-        // Attach the final scores to the bets before sending
         const enrichedBets = bets.map(b => {
             const betObj = b.toObject();
             if (betObj.status !== 'Open' && betObj.type === 'Sports') {
@@ -560,34 +553,33 @@ setInterval(async () => {
             let allWon = true;
 
             for (let sel of bet.selections) {
-                // 1. Check if Admin injected a FIXED result for this exact match
-                let fixedRes = await MatchResult.findOne({ matchName: sel.match });
-                
                 let hs, as, isFinished = false;
 
-                if (fixedRes) {
-                    hs = fixedRes.hs;
-                    as = fixedRes.as;
-                    isFinished = true;
-                } else {
-                    // 2. Fallback to extracting the Start Time
-                    let matchStartTime = new Date(bet.createdAt).getTime(); // Safe fallback
-                    
-                    const teams = sel.match.split(' vs ');
-                    if (teams.length === 2) {
-                        const game = await LiveGame.findOne({ home: teams[0].trim(), away: teams[1].trim() });
-                        if (game && game.commenceTime) {
-                            matchStartTime = new Date(game.commenceTime).getTime();
-                        }
+                // 1. Extract the Start Time safely
+                let matchStartTime = new Date(bet.createdAt).getTime(); // Fallback
+                
+                const teams = sel.match.split(' vs ');
+                if (teams.length === 2) {
+                    const game = await LiveGame.findOne({ home: teams[0].trim(), away: teams[1].trim() });
+                    if (game && game.commenceTime) {
+                        matchStartTime = new Date(game.commenceTime).getTime();
                     }
+                }
 
-                    // A soccer match takes ~115 minutes from kickoff
-                    const minutesSinceStart = (Date.now() - matchStartTime) / 60000;
+                // 2. A soccer match takes ~115 minutes from kickoff
+                const minutesSinceStart = (Date.now() - matchStartTime) / 60000;
+                
+                // 🟢 SECURE GATE: ONLY SETTLE IF 115 MINUTES HAVE ACTUALLY PASSED
+                if (minutesSinceStart >= 115) {
+                    isFinished = true;
                     
-                    // 🟢 SECURE GATE: ONLY SETTLE IF 115 MINUTES HAVE ACTUALLY PASSED
-                    if (minutesSinceStart >= 115) {
-                        isFinished = true;
-                        
+                    // 3. Now check if Admin injected a FIXED result, OR auto-simulate
+                    let fixedRes = await MatchResult.findOne({ matchName: sel.match });
+                    
+                    if (fixedRes) {
+                        hs = fixedRes.hs;
+                        as = fixedRes.as;
+                    } else {
                         // Use $setOnInsert to prevent race conditions
                         let newRes = await MatchResult.findOneAndUpdate(
                             { matchName: sel.match },
@@ -597,6 +589,9 @@ setInterval(async () => {
                         hs = newRes.hs;
                         as = newRes.as;
                     }
+                } else {
+                    // Match has not finished yet, don't settle
+                    isFinished = false;
                 }
 
                 if (!isFinished) {
@@ -604,7 +599,7 @@ setInterval(async () => {
                     break;
                 }
 
-                // 3. Evaluate the Pick
+                // 4. Evaluate the Pick (if match is finished)
                 let wonSelection = false;
                 
                 if (sel.pick === '1' && hs > as) wonSelection = true;
