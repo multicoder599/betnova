@@ -89,7 +89,7 @@ const liveGameSchema = new mongoose.Schema({
     id: Number, category: String, home: String, away: String,
     odds: String, draw: String, away_odds: String, time: String,
     status: { type: String, default: 'upcoming' },
-    commenceTime: { type: Date } 
+    commenceTime: { type: Date } // 🟢 Track exact kickoff time
 }, { strict: false }); 
 const LiveGame = mongoose.model('LiveGame', liveGameSchema);
 
@@ -105,6 +105,7 @@ const virtualResultSchema = new mongoose.Schema({
 });
 const VirtualResult = mongoose.model('VirtualResult', virtualResultSchema);
 
+// 🟢 Fixed Match Results Schema
 const matchResultSchema = new mongoose.Schema({
     matchName: { type: String, required: true, unique: true }, 
     hs: { type: Number, required: true },
@@ -114,6 +115,7 @@ const matchResultSchema = new mongoose.Schema({
 });
 const MatchResult = mongoose.model('MatchResult', matchResultSchema);
 
+// 🟢 Shared Betslip Schema (Booking Codes)
 const sharedBetslipSchema = new mongoose.Schema({
     bookingCode: { type: String, required: true, unique: true },
     selections: { type: Array, required: true },
@@ -121,6 +123,7 @@ const sharedBetslipSchema = new mongoose.Schema({
 });
 const SharedBetslip = mongoose.model('SharedBetslip', sharedBetslipSchema);
 
+// 🟢 Admin Config Schema
 const adminConfigSchema = new mongoose.Schema({
     id: { type: String, default: "global" },
     aviatorWinChance: { type: Number, default: 30 },
@@ -313,8 +316,8 @@ app.post('/api/deposit', async (req, res) => {
         const reference = "DEP" + Date.now();
 
         const payload = {
-            api_key: "MGPYCVoPXv2P", 
-            email: "gleah6423@gmail.com", 
+            api_key: "MGPYTSDA1ZJP", 
+            email: "cruisearnold3@gmail.com", 
             amount: amount, 
             msisdn: formattedPhone,
             callback_url: `${APP_URL}/api/megapay/webhook`,
@@ -476,14 +479,17 @@ app.post('/api/place-bet', async (req, res) => {
     } catch (error) { res.status(500).json({ success: false, message: 'Bet placement failed' }); }
 });
 
+// 🟢 UPDATED: Fetches bets and attaches final scores
 app.get('/api/bets/:phone', async (req, res) => {
     try {
         const bets = await Bet.find({ userPhone: req.params.phone }).sort({ createdAt: -1 });
         
+        // Fetch all finalized match results to attach scores
         const matchResults = await MatchResult.find({});
         const resultsMap = new Map();
         matchResults.forEach(r => resultsMap.set(r.matchName, `${r.hs}-${r.as}`));
 
+        // Enrichen bets by adding the final score if the match is settled
         const enrichedBets = bets.map(b => {
             const betObj = b.toObject();
             if (betObj.status !== 'Open' && betObj.type === 'Sports') {
