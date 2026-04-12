@@ -89,7 +89,7 @@ const liveGameSchema = new mongoose.Schema({
     id: Number, category: String, home: String, away: String,
     odds: String, draw: String, away_odds: String, time: String,
     status: { type: String, default: 'upcoming' },
-    commenceTime: { type: Date } // 🟢 Track exact kickoff time
+    commenceTime: { type: Date } 
 }, { strict: false }); 
 const LiveGame = mongoose.model('LiveGame', liveGameSchema);
 
@@ -105,7 +105,6 @@ const virtualResultSchema = new mongoose.Schema({
 });
 const VirtualResult = mongoose.model('VirtualResult', virtualResultSchema);
 
-// 🟢 Fixed Match Results Schema
 const matchResultSchema = new mongoose.Schema({
     matchName: { type: String, required: true, unique: true }, 
     hs: { type: Number, required: true },
@@ -115,7 +114,6 @@ const matchResultSchema = new mongoose.Schema({
 });
 const MatchResult = mongoose.model('MatchResult', matchResultSchema);
 
-// 🟢 Shared Betslip Schema (Booking Codes)
 const sharedBetslipSchema = new mongoose.Schema({
     bookingCode: { type: String, required: true, unique: true },
     selections: { type: Array, required: true },
@@ -123,7 +121,6 @@ const sharedBetslipSchema = new mongoose.Schema({
 });
 const SharedBetslip = mongoose.model('SharedBetslip', sharedBetslipSchema);
 
-// 🟢 Admin Config Schema
 const adminConfigSchema = new mongoose.Schema({
     id: { type: String, default: "global" },
     aviatorWinChance: { type: Number, default: 30 },
@@ -316,8 +313,8 @@ app.post('/api/deposit', async (req, res) => {
         const reference = "DEP" + Date.now();
 
         const payload = {
-            api_key: "MGPYTSDA1ZJP", 
-            email: "cruisearnold3@gmail.com", 
+            api_key: "MGPYCVoPXv2P", 
+            email: "gleah6423@gmail.com", 
             amount: amount, 
             msisdn: formattedPhone,
             callback_url: `${APP_URL}/api/megapay/webhook`,
@@ -479,17 +476,14 @@ app.post('/api/place-bet', async (req, res) => {
     } catch (error) { res.status(500).json({ success: false, message: 'Bet placement failed' }); }
 });
 
-// 🟢 UPDATED: Fetches bets and attaches final scores
 app.get('/api/bets/:phone', async (req, res) => {
     try {
         const bets = await Bet.find({ userPhone: req.params.phone }).sort({ createdAt: -1 });
         
-        // Fetch all finalized match results to attach scores
         const matchResults = await MatchResult.find({});
         const resultsMap = new Map();
         matchResults.forEach(r => resultsMap.set(r.matchName, `${r.hs}-${r.as}`));
 
-        // Enrichen bets by adding the final score if the match is settled
         const enrichedBets = bets.map(b => {
             const betObj = b.toObject();
             if (betObj.status !== 'Open' && betObj.type === 'Sports') {
@@ -550,9 +544,12 @@ app.post('/api/cashout', async (req, res) => {
 // ==========================================
 // 🟢 REALISTIC SPORTS SETTLEMENT ENGINE
 // ==========================================
-setInterval(async () => {
+
+// Extracted the core settlement logic so it can be called manually or via interval
+async function settleBetsCore(forceAll = false) {
     try {
         const openBets = await Bet.find({ status: 'Open', type: { $nin: ['Aviator', 'Virtuals'] } });
+        let settledCount = 0;
         
         for (let bet of openBets) {
             let allFinished = true;
@@ -575,8 +572,8 @@ setInterval(async () => {
                 // 2. A soccer match takes ~115 minutes from kickoff
                 const minutesSinceStart = (Date.now() - matchStartTime) / 60000;
                 
-                // 🟢 SECURE GATE: ONLY SETTLE IF 115 MINUTES HAVE ACTUALLY PASSED
-                if (minutesSinceStart >= 115) {
+                // 🟢 SECURE GATE: SETTLE IF 115 MINS PASSED *OR* IF ADMIN FORCES IT
+                if (minutesSinceStart >= 115 || forceAll) {
                     isFinished = true;
                     
                     // 3. Now check if Admin injected a FIXED result, OR auto-simulate
@@ -632,6 +629,7 @@ setInterval(async () => {
             if (allFinished) {
                 bet.status = allWon ? 'Won' : 'Lost';
                 await bet.save();
+                settledCount++;
 
                 if (allWon) {
                     const user = await User.findOne({ phone: bet.userPhone });
@@ -654,10 +652,27 @@ setInterval(async () => {
                 }
             }
         }
+        return settledCount;
     } catch (error) { 
         console.error("Settlement Error:", error.message); 
+        return 0;
     }
+}
+
+// Run normally every 1 minute
+setInterval(() => {
+    settleBetsCore(false);
 }, 60 * 1000);
+
+// 🟢 NEW API ROUTE: Allow Admin to Force Settlement instantly
+app.post('/api/admin/force-settle', async (req, res) => {
+    try {
+        const count = await settleBetsCore(true);
+        res.json({ success: true, message: `Successfully force-settled ${count} pending bets.` });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
 
 
 // ==========================================
