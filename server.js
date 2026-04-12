@@ -480,6 +480,7 @@ app.get('/api/bets/:phone', async (req, res) => {
     try {
         const bets = await Bet.find({ userPhone: req.params.phone }).sort({ createdAt: -1 });
         
+        // Fetch active live map for fallback purposes
         const matchResults = await MatchResult.find({});
         const resultsMap = new Map();
         matchResults.forEach(r => resultsMap.set(r.matchName, `${r.hs}-${r.as}`));
@@ -488,7 +489,8 @@ app.get('/api/bets/:phone', async (req, res) => {
             const betObj = b.toObject();
             if (betObj.status !== 'Open' && betObj.type === 'Sports') {
                 betObj.selections = betObj.selections.map(sel => {
-                    if (resultsMap.has(sel.match)) {
+                    // Use the permanently saved score, or fallback to the live map for older bets
+                    if (!sel.finalScore && resultsMap.has(sel.match)) {
                         sel.finalScore = resultsMap.get(sel.match);
                     }
                     return sel;
@@ -545,7 +547,6 @@ app.post('/api/cashout', async (req, res) => {
 // 🟢 REALISTIC SPORTS SETTLEMENT ENGINE
 // ==========================================
 
-// Extracted the core settlement logic so it can be called manually or via interval
 async function settleBetsCore(forceAll = false) {
     try {
         const openBets = await Bet.find({ status: 'Open', type: { $nin: ['Aviator', 'Virtuals'] } });
@@ -555,11 +556,12 @@ async function settleBetsCore(forceAll = false) {
             let allFinished = true;
             let allWon = true;
 
-            for (let sel of bet.selections) {
+            for (let i = 0; i < bet.selections.length; i++) {
+                let sel = bet.selections[i];
                 let hs, as, isFinished = false;
 
                 // 1. Extract the Start Time safely
-                let matchStartTime = new Date(bet.createdAt).getTime(); // Fallback
+                let matchStartTime = new Date(bet.createdAt).getTime(); 
                 
                 const teams = sel.match.split(' vs ');
                 if (teams.length === 2) {
@@ -583,7 +585,6 @@ async function settleBetsCore(forceAll = false) {
                         hs = fixedRes.hs;
                         as = fixedRes.as;
                     } else {
-                        // Use $setOnInsert to prevent race conditions
                         let newRes = await MatchResult.findOneAndUpdate(
                             { matchName: sel.match },
                             { $setOnInsert: { hs: Math.floor(Math.random() * 4), as: Math.floor(Math.random() * 3), status: 'FINISHED' } },
@@ -593,7 +594,6 @@ async function settleBetsCore(forceAll = false) {
                         as = newRes.as;
                     }
                 } else {
-                    // Match has not finished yet, don't settle
                     isFinished = false;
                 }
 
@@ -602,7 +602,7 @@ async function settleBetsCore(forceAll = false) {
                     break;
                 }
 
-                // 4. Evaluate the Pick (if match is finished)
+                // 4. Evaluate the Pick 
                 let wonSelection = false;
                 
                 if (sel.pick === '1' && hs > as) wonSelection = true;
@@ -622,12 +622,17 @@ async function settleBetsCore(forceAll = false) {
                 else if (sel.pick === '12' && hs !== as) wonSelection = true;
 
                 if (!wonSelection) {
-                    allWon = false; // One wrong pick ruins the accumulator
+                    allWon = false; 
                 }
+
+                // 🟢 PERMANENTLY SAVE THE FINAL SCORE DIRECTLY TO THE TICKET
+                sel.finalScore = `${hs}-${as}`;
+                sel.legStatus = wonSelection ? 'Won' : 'Lost';
             }
 
             if (allFinished) {
                 bet.status = allWon ? 'Won' : 'Lost';
+                bet.markModified('selections'); // Tell Mongoose the array objects were updated
                 await bet.save();
                 settledCount++;
 
@@ -664,7 +669,7 @@ setInterval(() => {
     settleBetsCore(false);
 }, 60 * 1000);
 
-// 🟢 NEW API ROUTE: Allow Admin to Force Settlement instantly
+// 🟢 API ROUTE: Allow Admin to Force Settlement instantly
 app.post('/api/admin/force-settle', async (req, res) => {
     try {
         const count = await settleBetsCore(true);
