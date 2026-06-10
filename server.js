@@ -14,9 +14,9 @@ const server = http.createServer(app);
 // CORS CONFIGURATION
 // ==========================================
 app.use(cors({
-    origin: "*", 
+    origin: ['https://betnova.co.ke', 'https://www.betnova.co.ke'],
     methods: ['GET', 'POST', 'PUT', 'DELETE'],
-    credentials: false 
+    credentials: true
 }));
 
 app.use(express.json());
@@ -309,7 +309,7 @@ app.post('/api/deposit', async (req, res) => {
         if (formattedPhone.startsWith('0')) formattedPhone = '254' + formattedPhone.substring(1);
         if (formattedPhone.startsWith('7') || formattedPhone.startsWith('1')) formattedPhone = '254' + formattedPhone;
 
-        const APP_URL = process.env.APP_URL || 'https://betnova-1t1z.onrender.com';
+        const APP_URL = process.env.APP_URL || 'https://api.betnova.co.ke';
         const reference = "DEP" + Date.now();
 
         const payload = {
