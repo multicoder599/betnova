@@ -14,7 +14,7 @@ const server = http.createServer(app);
 // CORS CONFIGURATION
 // ==========================================
 app.use(cors({
-    origin: ['https://betnova.co.ke', 'https://www.betnova.co.ke'],
+    origin: ['https://betnova.co.ke', 'https://www.betnova.co.ke', 'https://api.betnova.co.ke'],
     methods: ['GET', 'POST', 'PUT', 'DELETE'],
     credentials: true
 }));
