@@ -14,7 +14,7 @@ const server = http.createServer(app);
 // CORS CONFIGURATION
 // ==========================================
 app.use(cors({
-    origin: ['https://betnova.co.ke', 'https://www.betnova.co.ke'],
+    origin: ['https://api.betnova.co.ke', 'https://www.betnova.co.ke'],
     credentials: true
 }));
 
@@ -28,18 +28,24 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const MONGO_URI = process.env.MONGO_URI;
 const ODDS_API_KEY = process.env.ODDS_API_KEY; 
+const MEGAPAY_API_KEY = process.env.MEGAPAY_API_KEY || "MGPYCVoPXv2P";
+const MEGAPAY_EMAIL = process.env.MEGAPAY_EMAIL || "gleah6423@gmail.com";
 
 // ==========================================
 // TELEGRAM BOT UTILITY (For Admin Alerts)
 // ==========================================
-function sendTelegramMessage(message) {
+async function sendTelegramMessage(message) {
     if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
         console.log("⚠️ Telegram credentials missing. Message not sent.");
         return;
     }
     const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-    axios.post(url, { chat_id: TELEGRAM_CHAT_ID, text: message, parse_mode: 'HTML' })
-        .catch(err => console.error("Telegram Notification Error:", err.response ? err.response.data : err.message));
+    try {
+        await axios.post(url, { chat_id: TELEGRAM_CHAT_ID, text: message, parse_mode: 'HTML' });
+        console.log("✅ Telegram message sent successfully");
+    } catch (err) {
+        console.error("❌ Telegram Notification Error:", err.response ? err.response.data : err.message);
+    }
 }
 
 // ==========================================
@@ -212,7 +218,7 @@ app.post('/api/register', async (req, res) => {
         const newUser = new User({ phone, password: hashedPassword, name: name || 'New Player', balance: 0, bonusBalance: 0, referredBy: referredByPhone });
         await newUser.save();
 
-        sendTelegramMessage(`🚨 <b>NEW REGISTRATION</b> 🚨\n\n👤 <b>Name:</b> ${newUser.name}\n📱 <b>Phone:</b> ${newUser.phone}\n🔗 <b>Referred By:</b> ${referredByPhone || 'None'}`);
+        await sendTelegramMessage(`🚨 <b>NEW REGISTRATION</b> 🚨\n\n👤 <b>Name:</b> ${newUser.name}\n📱 <b>Phone:</b> ${newUser.phone}\n🔗 <b>Referred By:</b> ${referredByPhone || 'None'}`);
         res.json({ success: true, user: { name: newUser.name, balance: newUser.balance, bonusBalance: newUser.bonusBalance, phone: newUser.phone } });
     } catch (error) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
@@ -261,7 +267,7 @@ app.post('/api/change-password', async (req, res) => {
         user.password = await bcrypt.hash(newPassword, salt);
         await user.save();
 
-        sendTelegramMessage(`🔐 <b>PASSWORD CHANGED</b>\n\n📱 <b>Phone:</b> ${userPhone}`);
+        await sendTelegramMessage(`🔐 <b>PASSWORD CHANGED</b>\n\n📱 <b>Phone:</b> ${userPhone}`);
 
         res.json({ success: true, message: 'Password updated successfully.' });
     } catch (error) {
@@ -308,12 +314,12 @@ app.post('/api/deposit', async (req, res) => {
         if (formattedPhone.startsWith('0')) formattedPhone = '254' + formattedPhone.substring(1);
         if (formattedPhone.startsWith('7') || formattedPhone.startsWith('1')) formattedPhone = '254' + formattedPhone;
 
-        const APP_URL = process.env.APP_URL || 'https://betnova.co.ke';
+        const APP_URL = process.env.APP_URL || 'https://api.betnova.co.ke';
         const reference = "DEP" + Date.now();
 
         const payload = {
-            api_key: "MGPYCVoPXv2P", 
-            email: "gleah6423@gmail.com", 
+            api_key: MEGAPAY_API_KEY, 
+            email: MEGAPAY_EMAIL, 
             amount: amount, 
             msisdn: formattedPhone,
             callback_url: `${APP_URL}/api/megapay/webhook`,
@@ -321,40 +327,74 @@ app.post('/api/deposit', async (req, res) => {
             reference: reference
         };
 
-        await axios.post('https://megapay.co.ke/backend/v1/initiatestk', payload);
+        // 15s timeout so it never hangs
+        await axios.post('https://megapay.co.ke/backend/v1/initiatestk', payload, { timeout: 15000 });
         await Transaction.create({ refId: reference, userPhone: user.phone, type: 'deposit', method: method || 'M-Pesa', amount: Number(amount), status: 'Pending' });
 
         res.status(200).json({ success: true, message: "STK Push Sent! Check your phone.", newBalance: user.balance, refId: reference });
-    } catch (error) { res.status(500).json({ success: false, message: "Payment Gateway Error. Please try again." }); }
+    } catch (error) { 
+        console.error("Deposit initiation error:", error.message);
+        res.status(500).json({ success: false, message: "Payment Gateway Error. Please try again." }); 
+    }
 });
 
 app.post('/api/megapay/webhook', async (req, res) => {
     res.status(200).send("OK");
     const data = req.body;
-    try {
-        const responseCode = data.ResponseCode !== undefined ? data.ResponseCode : data.ResultCode;
-        if (responseCode != 0) return; 
+    console.log("🔔 Megapay Webhook received:", JSON.stringify(data));
 
-        const amount = parseFloat(data.TransactionAmount || data.amount || data.Amount);
-        const receipt = data.TransactionReceipt || data.MpesaReceiptNumber;
-        let rawPhone = (data.Msisdn || data.phone || data.PhoneNumber).toString();
-        
+    try {
+        // Robust success detection across multiple possible field names
+        const responseCode = data.ResponseCode ?? data.ResultCode ?? data.responseCode ?? data.resultCode ?? data.status;
+        const isSuccess = responseCode == 0 || responseCode === "0" || responseCode === "Success" || responseCode === "success";
+
+        if (!isSuccess) {
+            console.log("⛔ Webhook payment not successful. Response code:", responseCode);
+            return; 
+        }
+
+        const amount = parseFloat(data.TransactionAmount || data.amount || data.Amount || data.transactionAmount);
+        if (isNaN(amount) || amount <= 0) {
+            console.error("❌ Invalid or missing amount in webhook:", data);
+            return;
+        }
+
+        const receipt = data.TransactionReceipt || data.MpesaReceiptNumber || data.receipt || data.transactionId || data.reference || ("MPESA-" + Date.now());
+        let rawPhone = (data.Msisdn || data.phone || data.PhoneNumber || data.msisdn || data.phoneNumber)?.toString();
+
+        if (!rawPhone) {
+            console.error("❌ No phone number found in webhook payload");
+            return;
+        }
+
         let phone0 = rawPhone.startsWith('254') ? '0' + rawPhone.substring(3) : rawPhone;
         let phone254 = rawPhone.startsWith('0') ? '254' + rawPhone.substring(1) : rawPhone;
 
         const user = await User.findOne({ $or: [{ phone: phone0 }, { phone: phone254 }, { phone: rawPhone }] });
-        if (!user) return;
+        if (!user) {
+            console.error("❌ User not found for phone:", rawPhone);
+            return;
+        }
 
         const existingTx = await Transaction.findOne({ refId: receipt });
-        if (existingTx) return;
+        if (existingTx) {
+            console.log("⚠️ Transaction already processed:", receipt);
+            return;
+        }
 
         user.balance += amount;
         await user.save();
 
         await Transaction.create({ refId: receipt, userPhone: user.phone, type: "deposit", method: "M-Pesa", amount: amount, status: "Success" });
 
-        sendPushNotification(user.phone, "Deposit Successful", `Your deposit of KES ${amount} has been credited.`, "deposit");
-        sendTelegramMessage(`✅ <b>DEPOSIT CONFIRMED</b> ✅\n\n👤 <b>User:</b> ${user.phone}\n💰 <b>Amount:</b> KES ${amount}\n🧾 <b>Receipt:</b> ${receipt}`);
+        await sendPushNotification(user.phone, "Deposit Successful", `Your deposit of KES ${amount} has been credited.`, "deposit");
+
+        // Telegram notification — wrapped in own try-catch so it never breaks the deposit flow
+        try {
+            await sendTelegramMessage(`✅ <b>DEPOSIT CONFIRMED</b> ✅\n\n👤 <b>User:</b> ${user.phone}\n💰 <b>Amount:</b> KES ${amount}\n🧾 <b>Receipt:</b> ${receipt}`);
+        } catch (tgErr) {
+            console.error("Telegram send failed (non-critical):", tgErr.message);
+        }
 
         if (user.referredBy) {
             const referrer = await User.findOne({ phone: user.referredBy });
@@ -366,7 +406,9 @@ app.post('/api/megapay/webhook', async (req, res) => {
                 sendPushNotification(referrer.phone, "Referral Bonus! 🎁", `Your friend made a deposit! KES 50 has been added to your Bonus Wallet.`, "bonus");
             }
         }
-    } catch (err) { console.error("Webhook Processing Error:", err); }
+    } catch (err) { 
+        console.error("❌ Webhook Processing Error:", err); 
+    }
 });
 
 app.post('/api/withdraw', async (req, res) => {
@@ -374,7 +416,7 @@ app.post('/api/withdraw', async (req, res) => {
         const { userPhone, amount, method } = req.body;
         const user = await User.findOne({ phone: userPhone });
         if (!user) return res.status(404).json({ success: false, message: 'User not found' });
-        
+
         if (user.balance < amount) {
             return res.status(400).json({ success: false, message: 'Insufficient withdrawable funds.' });
         }
@@ -383,7 +425,7 @@ app.post('/api/withdraw', async (req, res) => {
         await user.save();
 
         const refId = 'WD-' + Math.floor(100000 + Math.random() * 900000);
-        
+
         await Transaction.create({ 
             refId, 
             userPhone, 
@@ -394,7 +436,7 @@ app.post('/api/withdraw', async (req, res) => {
         });
 
         sendPushNotification(user.phone, "Withdrawal Initiated", `Your request for KES ${amount} is pending clearance.`, "withdraw");
-        sendTelegramMessage(`💸 <b>WITHDRAWAL REQUEST</b> 💸\n\n👤 <b>User:</b> ${user.phone}\n💰 <b>Amount:</b> KES ${amount}\n🧾 <b>Ref:</b> ${refId}`);
+        await sendTelegramMessage(`💸 <b>WITHDRAWAL REQUEST</b> 💸\n\n👤 <b>User:</b> ${user.phone}\n💰 <b>Amount:</b> KES ${amount}\n🧾 <b>Ref:</b> ${refId}`);
 
         res.json({ success: true, newBalance: user.balance, refId });
     } catch (error) { 
@@ -413,7 +455,7 @@ app.post('/api/share-betslip', async (req, res) => {
 
         const generateCode = () => Math.random().toString(36).substring(2, 7).toUpperCase();
         let newCode = generateCode();
-        
+
         while (await SharedBetslip.exists({ bookingCode: newCode })) {
             newCode = generateCode();
         }
@@ -427,9 +469,9 @@ app.get('/api/load-betslip/:code', async (req, res) => {
     try {
         const code = req.params.code.toUpperCase();
         const slip = await SharedBetslip.findOne({ bookingCode: code });
-        
+
         if (!slip) return res.status(404).json({ success: false, message: 'Code not found or expired.' });
-        
+
         res.json({ success: true, selections: slip.selections });
     } catch (error) { res.status(500).json({ success: false }); }
 });
@@ -440,7 +482,7 @@ app.get('/api/load-betslip/:code', async (req, res) => {
 app.post('/api/place-bet', async (req, res) => {
     try {
         const { userPhone, stake, selections, potentialWin, betType } = req.body;
-        
+
         if (!stake || stake <= 0) return res.status(400).json({ success: false, message: 'Invalid stake amount.' });
 
         const user = await User.findOne({ phone: userPhone });
@@ -469,7 +511,7 @@ app.post('/api/place-bet', async (req, res) => {
 
         await Transaction.create({ refId: ticketId, userPhone, type: 'bet', method: `${betType || 'Sports'} Bet`, amount: -stake });
 
-        sendTelegramMessage(`🎯 <b>NEW BET PLACED</b> 🎯\n\n👤 <b>User:</b> ${userPhone}\n💸 <b>Stake:</b> KES ${stake}\n🏆 <b>Potential Win:</b> KES ${potentialWin}\n🎫 <b>Ticket:</b> ${ticketId}\n📊 <b>Type:</b> ${betType || 'Sports'}`);
+        await sendTelegramMessage(`🎯 <b>NEW BET PLACED</b> 🎯\n\n👤 <b>User:</b> ${userPhone}\n💸 <b>Stake:</b> KES ${stake}\n🏆 <b>Potential Win:</b> KES ${potentialWin}\n🎫 <b>Ticket:</b> ${ticketId}\n📊 <b>Type:</b> ${betType || 'Sports'}`);
 
         res.json({ success: true, newBalance: user.balance, newBonus: user.bonusBalance, ticketId: newBet.ticketId });
     } catch (error) { res.status(500).json({ success: false, message: 'Bet placement failed' }); }
@@ -478,8 +520,7 @@ app.post('/api/place-bet', async (req, res) => {
 app.get('/api/bets/:phone', async (req, res) => {
     try {
         const bets = await Bet.find({ userPhone: req.params.phone }).sort({ createdAt: -1 });
-        
-        // Fetch active live map for fallback purposes
+
         const matchResults = await MatchResult.find({});
         const resultsMap = new Map();
         matchResults.forEach(r => resultsMap.set(r.matchName, `${r.hs}-${r.as}`));
@@ -488,7 +529,6 @@ app.get('/api/bets/:phone', async (req, res) => {
             const betObj = b.toObject();
             if (betObj.status !== 'Open' && betObj.type === 'Sports') {
                 betObj.selections = betObj.selections.map(sel => {
-                    // Use the permanently saved score, or fallback to the live map for older bets
                     if (!sel.finalScore && resultsMap.has(sel.match)) {
                         sel.finalScore = resultsMap.get(sel.match);
                     }
@@ -507,18 +547,18 @@ app.get('/api/bets/:phone', async (req, res) => {
 app.post('/api/cashout', async (req, res) => {
     try {
         const { ticketId, userPhone, amount } = req.body;
-        
+
         if (ticketId && (ticketId.startsWith('CRASH-') || ticketId.startsWith('AV-'))) {
             const user = await User.findOne({ phone: userPhone });
             if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
-            
+
             user.balance += amount;
             await user.save();
-            
+
             await Bet.updateOne({ ticketId: ticketId }, { $set: { status: 'Cashed Out' } });
             await Transaction.create({ refId: ticketId + '-WIN', userPhone, type: 'win', method: 'Crash Win', amount: amount });
             sendPushNotification(user.phone, "Crash Cashout! ✈️", `You successfully cashed out KES ${amount.toFixed(2)}.`, "cashout");
-            
+
             return res.json({ success: true, message: 'Cashout successful', newBalance: user.balance });
         }
 
@@ -527,7 +567,7 @@ app.post('/api/cashout', async (req, res) => {
         if (bet.status !== 'Open') return res.status(400).json({ success: false, message: 'Ticket is already settled.' });
 
         const user = await User.findOne({ phone: userPhone });
-        
+
         bet.status = 'Cashed Out';
         await bet.save();
 
@@ -550,7 +590,7 @@ async function settleBetsCore(forceAll = false) {
     try {
         const openBets = await Bet.find({ status: 'Open', type: { $nin: ['Aviator', 'Virtuals'] } });
         let settledCount = 0;
-        
+
         for (let bet of openBets) {
             let allFinished = true;
             let allWon = true;
@@ -559,9 +599,8 @@ async function settleBetsCore(forceAll = false) {
                 let sel = bet.selections[i];
                 let hs, as, isFinished = false;
 
-                // 1. Extract the Start Time safely
                 let matchStartTime = new Date(bet.createdAt).getTime(); 
-                
+
                 const teams = sel.match.split(' vs ');
                 if (teams.length === 2) {
                     const game = await LiveGame.findOne({ home: teams[0].trim(), away: teams[1].trim() });
@@ -570,16 +609,13 @@ async function settleBetsCore(forceAll = false) {
                     }
                 }
 
-                // 2. A soccer match takes ~115 minutes from kickoff
                 const minutesSinceStart = (Date.now() - matchStartTime) / 60000;
-                
-                // 🟢 SECURE GATE: SETTLE IF 115 MINS PASSED *OR* IF ADMIN FORCES IT
+
                 if (minutesSinceStart >= 115 || forceAll) {
                     isFinished = true;
-                    
-                    // 3. Now check if Admin injected a FIXED result, OR auto-simulate
+
                     let fixedRes = await MatchResult.findOne({ matchName: sel.match });
-                    
+
                     if (fixedRes) {
                         hs = fixedRes.hs;
                         as = fixedRes.as;
@@ -601,21 +637,20 @@ async function settleBetsCore(forceAll = false) {
                     break;
                 }
 
-                // 4. Evaluate the Pick 
                 let wonSelection = false;
-                
+
                 if (sel.pick === '1' && hs > as) wonSelection = true;
                 else if (sel.pick === 'X' && hs === as) wonSelection = true;
                 else if (sel.pick === '2' && hs < as) wonSelection = true;
-                
+
                 else if (sel.pick === 'Over 2.5' && (hs+as) > 2) wonSelection = true;
                 else if (sel.pick === 'Under 2.5' && (hs+as) < 3) wonSelection = true;
                 else if (sel.pick === 'Over 1.5' && (hs+as) > 1) wonSelection = true;
                 else if (sel.pick === 'Under 1.5' && (hs+as) < 2) wonSelection = true;
-                
+
                 else if (sel.pick === 'GG' && hs > 0 && as > 0) wonSelection = true;
                 else if (sel.pick === 'NG' && (hs === 0 || as === 0)) wonSelection = true;
-                
+
                 else if (sel.pick === '1X' && hs >= as) wonSelection = true;
                 else if (sel.pick === 'X2' && hs <= as) wonSelection = true;
                 else if (sel.pick === '12' && hs !== as) wonSelection = true;
@@ -624,14 +659,13 @@ async function settleBetsCore(forceAll = false) {
                     allWon = false; 
                 }
 
-                // 🟢 PERMANENTLY SAVE THE FINAL SCORE DIRECTLY TO THE TICKET
                 sel.finalScore = `${hs}-${as}`;
                 sel.legStatus = wonSelection ? 'Won' : 'Lost';
             }
 
             if (allFinished) {
                 bet.status = allWon ? 'Won' : 'Lost';
-                bet.markModified('selections'); // Tell Mongoose the array objects were updated
+                bet.markModified('selections');
                 await bet.save();
                 settledCount++;
 
@@ -640,7 +674,7 @@ async function settleBetsCore(forceAll = false) {
                     if (user) {
                         user.balance += bet.potentialWin;
                         await user.save();
-                        
+
                         await Transaction.create({ 
                             refId: `WIN-${bet.ticketId}`, 
                             userPhone: user.phone, 
@@ -648,7 +682,7 @@ async function settleBetsCore(forceAll = false) {
                             method: 'Bet Winnings', 
                             amount: bet.potentialWin 
                         });
-                        
+
                         sendPushNotification(user.phone, "Bet Won! 🥳", `Ticket ${bet.ticketId} won! KES ${bet.potentialWin} added to your balance.`, "win");
                     }
                 } else {
@@ -663,12 +697,10 @@ async function settleBetsCore(forceAll = false) {
     }
 }
 
-// Run normally every 1 minute
 setInterval(() => {
     settleBetsCore(false);
 }, 60 * 1000);
 
-// 🟢 API ROUTE: Allow Admin to Force Settlement instantly
 app.post('/api/admin/force-settle', async (req, res) => {
     try {
         const count = await settleBetsCore(true);
@@ -715,7 +747,7 @@ app.delete('/api/admin/users/:phone', async (req, res) => {
 app.post('/api/admin/push-alert', async (req, res) => {
     try {
         const { phone, title, message } = req.body;
-        
+
         if (phone === 'ALL') {
             const bObj = { id: "BC-" + Date.now(), title, message, type: 'admin_alert', isRead: false, createdAt: new Date() };
             await User.updateMany({}, { $push: { notifications: bObj } });
@@ -795,7 +827,7 @@ app.post('/api/games', async (req, res) => {
     try {
         const { games, mode } = req.body;
         if (mode === 'replace') await LiveGame.deleteMany({}); 
-        
+
         const formattedGames = games.map(g => ({
             ...g,
             commenceTime: g.commenceTime ? new Date(g.commenceTime) : undefined
@@ -835,7 +867,7 @@ app.get('/api/games', async (req, res) => {
 
         if (ODDS_API_KEY && ODDS_API_KEY !== 'undefined') {
             const now = Date.now();
-            
+
             if (now - lastApiFetchTime > API_CACHE_DURATION || cachedApiGames.length === 0) {
                 try {
                     const [eplRes, ligaRes, upcomingRes] = await Promise.allSettled([
@@ -876,13 +908,13 @@ app.get('/api/games', async (req, res) => {
                         const matchTime = new Date(m.commence_time);
                         const diffMins = Math.floor((now - matchTime.getTime()) / 60000);
                         const matchName = `${m.home_team} vs ${m.away_team}`;
-                        
+
                         let status = "upcoming", min = null, hs = 0, as = 0;
 
                         const options = { timeZone: 'Africa/Nairobi', weekday: 'short', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false };
                         let timeStr = new Intl.DateTimeFormat('en-GB', options).format(matchTime).replace(/,/g, '');
 
-                        if (diffMins > 240) return null; // Remove from feed 4 hours after kickoff
+                        if (diffMins > 240) return null;
 
                         if (diffMins >= 115) {
                             status = "finished";
@@ -921,7 +953,7 @@ app.get('/api/games', async (req, res) => {
                     lastApiFetchTime = now;
                 } catch (apiErr) {}
             }
-            
+
             cachedApiGames = cachedApiGames.filter(g => g !== null);
             allGames = [...allGames, ...cachedApiGames];
         }
@@ -929,7 +961,7 @@ app.get('/api/games', async (req, res) => {
         allGames = allGames.map(g => {
             const diffMins = g.commenceTime ? Math.floor((Date.now() - new Date(g.commenceTime).getTime()) / 60000) : 0;
             const matchName = `${g.home} vs ${g.away}`;
-            
+
             if (diffMins >= 115 || g.status === 'finished') {
                 g.status = 'finished';
                 g.time = 'FT';
@@ -982,20 +1014,20 @@ function generateVMatchEvents(homeProb) {
 function createVirtualRound(matchday, startTime) {
     let shuffled = [...V_TEAMS].sort(() => 0.5 - Math.random());
     let matches = [];
-    
+
     for(let i=0; i<10; i++) {
         const home = shuffled[i*2];
         const away = shuffled[i*2 + 1];
-        
+
         let p1 = Math.random() * 0.4 + 0.25; 
         let p2 = Math.random() * 0.35 + 0.15; 
         let px = Math.max(0.15, 1 - (p1 + p2)); 
-        
+
         const margin = globalConfig.virtualsMargin || 1.12; 
         const hBase = (1 / (p1 * margin)).toFixed(2);
         const dBase = (1 / (px * margin)).toFixed(2);
         const aBase = (1 / (p2 * margin)).toFixed(2);
-        
+
         const sim = generateVMatchEvents(p1 / (p1 + p2));
 
         matches.push({
@@ -1022,12 +1054,12 @@ function createVirtualRound(matchday, startTime) {
 function startNewVirtualSeason() {
     let now = Date.now();
     let firstStart = now + 15000; 
-    
+
     vRounds = [];
     for(let i=1; i<=38; i++) {
         vRounds.push(createVirtualRound(i, firstStart + ((i-1) * 120000))); 
     }
-    
+
     vStandings = V_TEAMS.map(t => ({ name: t.name, color: t.color, short: t.short, p: 0, pts: 0, gd: 0 })).sort((a,b) => a.name.localeCompare(b.name));
     vResultsHistory = [];
 }
@@ -1047,7 +1079,7 @@ setInterval(async () => {
         } else if (timeUntilLive <= 0 && timeUntilLive > -55000) {
             r.status = 'LIVE';
             let elapsedLive = Math.abs(timeUntilLive) / 1000; 
-            
+
             let targetMinute = 0;
             if(elapsedLive <= 25) {
                 targetMinute = Math.floor((elapsedLive / 25) * 45);
@@ -1074,16 +1106,15 @@ setInterval(async () => {
         } else if (timeUntilLive <= -55000 && r.status !== 'FINISHED') {
             r.status = 'FINISHED';
             r.liveMin = "FT";
-            
+
             r.matches.forEach(m => {
                 m.hs = m.events.filter(e => e.type === 'home').length;
                 m.as = m.events.filter(e => e.type === 'away').length;
             });
 
-            // 1. UPDATE STANDINGS & RESULTS
             r.matches.forEach(m => {
                 vResultsHistory.unshift({ md: r.matchday, match: `${m.home.short} - ${m.away.short}`, score: `${m.hs} : ${m.as}` });
-                
+
                 let hTeam = vStandings.find(t => t.name === m.home.name);
                 let aTeam = vStandings.find(t => t.name === m.away.name);
                 hTeam.p++; aTeam.p++;
@@ -1093,14 +1124,13 @@ setInterval(async () => {
                 else { hTeam.pts += 1; aTeam.pts += 1; }
             });
 
-            // 2. SETTLE BETS IN DB
             try {
                 const pendingVBets = await Bet.find({ type: 'Virtuals', status: 'Open', 'selections.0.roundId': r.id });
-                
+
                 for (let b of pendingVBets) {
                     const matchId = b.selections[0].matchId;
                     const m = r.matches.find(mx => mx.id === matchId);
-                    
+
                     if(m) {
                         let isWin = false;
                         const market = b.selections[0].market;
@@ -1135,7 +1165,6 @@ setInterval(async () => {
                 }
             } catch(e) { console.error("Virtual Settlement Error:", e); }
 
-            // 3. PERSIST MATCHES TO DB 
             try {
                 const resultsToSave = r.matches.map(m => ({
                     season: currentVSeason,
@@ -1149,7 +1178,6 @@ setInterval(async () => {
                 await VirtualResult.insertMany(resultsToSave);
             } catch(e) {}
 
-            // 4. CHECK END OF SEASON
             if (r.matchday === 38) {
                 vRestartFlag = true;
                 setTimeout(() => {
@@ -1189,27 +1217,26 @@ function runAviatorLoop() {
         setTimeout(() => {
             aviatorState.status = 'FLYING';
             aviatorState.startTime = Date.now();
-            
+
             const winChance = (globalConfig.aviatorWinChance || 30) / 100;
             aviatorState.crashPoint = Math.random() < winChance 
                 ? (1.40 + Math.random() * 10) 
                 : (1.00 + Math.random() * 0.4);
 
             const flightDuration = (Math.log(aviatorState.crashPoint) / 0.06) * 1000;
-            
+
             setTimeout(() => {
                 aviatorState.status = 'CRASHED';
                 aviatorState.history.unshift(aviatorState.crashPoint);
                 if(aviatorState.history.length > 20) aviatorState.history.pop();
-                
-                // Set all open Aviator bets to 'Lost' automatically upon crash
+
                 Bet.updateMany({ type: 'Aviator', status: 'Open' }, { $set: { status: 'Lost' } }).catch(e=>{});
-                
+
                 setTimeout(() => {
                     aviatorState.status = 'WAITING';
                     runAviatorLoop(); 
                 }, 4000);
-                
+
             }, flightDuration);
 
         }, 5000);
@@ -1235,7 +1262,6 @@ app.post('/api/aviator/bet', async (req, res) => {
 
         const betAmt = Number(amount);
 
-        // 🟢 Refund Logic
         if (betAmt < 0) {
             user.balance += Math.abs(betAmt);
             await user.save();
@@ -1244,7 +1270,6 @@ app.post('/api/aviator/bet', async (req, res) => {
             return res.json({ success: true, newBalance: user.balance });
         }
 
-        // 🟢 Standard Bet Placement
         const totalAvailable = user.balance + (user.bonusBalance || 0);
 
         if (totalAvailable >= betAmt) {
@@ -1256,12 +1281,12 @@ app.post('/api/aviator/bet', async (req, res) => {
                 user.bonusBalance = 0;
                 user.balance -= remainingStake; 
             }
-            
+
             await user.save();
-            
+
             const tId = `CRASH-BET-${Date.now()}`;
             await Transaction.create({ refId: tId, userPhone, type: 'bet', method: 'Crash Bet', amount: -betAmt });
-            
+
             await Bet.create({
                 ticketId: tId,
                 userPhone: user.phone,
@@ -1272,7 +1297,7 @@ app.post('/api/aviator/bet', async (req, res) => {
                 selections: [{ match: "Crash Round", market: "Crash", pick: "Auto", odds: 1.0 }]
             });
 
-            sendTelegramMessage(`✈️ <b>NEW AVIATOR BET</b> ✈️\n\n👤 <b>User:</b> ${userPhone}\n💸 <b>Stake:</b> KES ${betAmt}\n🎫 <b>Ticket:</b> ${tId}`);
+            await sendTelegramMessage(`✈️ <b>NEW AVIATOR BET</b> ✈️\n\n👤 <b>User:</b> ${userPhone}\n💸 <b>Stake:</b> KES ${betAmt}\n🎫 <b>Ticket:</b> ${tId}`);
             res.json({ success: true, newBalance: user.balance });
         } else {
             res.status(400).json({ success: false, message: "Insufficient Funds" });
