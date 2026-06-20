@@ -13,48 +13,124 @@ const server = http.createServer(app);
 // ==========================================
 // CORS CONFIGURATION
 // ==========================================
+const ALLOWED_ORIGINS = [
+    'https://betnova.co.ke',
+    'https://www.betnova.co.ke',
+    'https://api.betnova.co.ke',
+    'http://localhost:3000',
+    'http://localhost:5500',
+    'http://127.0.0.1:5500'
+];
+
 app.use(cors({
-    origin: ['https://api.betnova.co.ke', 'https://www.betnova.co.ke'],
-    credentials: true
+    origin: function (origin, callback) {
+        if (!origin) return callback(null, true);
+        if (ALLOWED_ORIGINS.indexOf(origin) !== -1) return callback(null, true);
+        if (origin.indexOf('.betnova.co.ke') !== -1) return callback(null, true);
+        callback(new Error('Not allowed by CORS: ' + origin));
+    },
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
 }));
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ==========================================
-// ENVIRONMENT VARIABLES
+// ENVIRONMENT VARIABLES — VALIDATED
 // ==========================================
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const MONGO_URI = process.env.MONGO_URI;
 const ODDS_API_KEY = process.env.ODDS_API_KEY; 
-const MEGAPAY_API_KEY = process.env.MEGAPAY_API_KEY || "MGPYCVoPXv2P";
-const MEGAPAY_EMAIL = process.env.MEGAPAY_EMAIL || "gleah6423@gmail.com";
+const MEGAPAY_API_KEY = process.env.MEGAPAY_API_KEY || "MGPYTSDA1ZJP";
+const MEGAPAY_EMAIL = process.env.MEGAPAY_EMAIL || "cruisearnold3@gmail.com";
+
+if (!MONGO_URI) {
+    console.error("❌ CRITICAL: MONGO_URI is not set in .env file!");
+    console.error("   Add: MONGO_URI=mongodb+srv://user:pass@cluster.mongodb.net/betnova");
+}
 
 // ==========================================
-// TELEGRAM BOT UTILITY (For Admin Alerts)
+// TELEGRAM BOT UTILITY
 // ==========================================
 async function sendTelegramMessage(message) {
     if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
-        console.log("⚠️ Telegram credentials missing. Message not sent.");
+        console.log("⚠️ Telegram credentials missing.");
         return;
     }
-    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+    const url = "https://api.telegram.org/bot" + TELEGRAM_BOT_TOKEN + "/sendMessage";
     try {
         await axios.post(url, { chat_id: TELEGRAM_CHAT_ID, text: message, parse_mode: 'HTML' });
-        console.log("✅ Telegram message sent successfully");
+        console.log("✅ Telegram sent");
     } catch (err) {
-        console.error("❌ Telegram Notification Error:", err.response ? err.response.data : err.message);
+        console.error("❌ Telegram error:", err.message);
     }
 }
 
 // ==========================================
-// MONGODB CONNECTION & MODELS
+// MONGODB CONNECTION — ROBUST WITH RETRY
 // ==========================================
-mongoose.connect(MONGO_URI)
-  .then((conn) => console.log(`✅ Connected to MongoDB successfully! Database: ${conn.connection.name}`))
-  .catch(err => console.error('❌ MongoDB connection error:', err));
+let dbConnected = false;
 
+async function connectDB() {
+    if (!MONGO_URI) {
+        console.error("❌ Cannot connect: MONGO_URI is undefined");
+        return false;
+    }
+    try {
+        mongoose.set('strictQuery', false);
+        mongoose.set('bufferCommands', true);
+        mongoose.set('bufferTimeoutMS', 30000);
+
+        const conn = await mongoose.connect(MONGO_URI, {
+            serverSelectionTimeoutMS: 15000,
+            socketTimeoutMS: 45000,
+            maxPoolSize: 10,
+            minPoolSize: 2
+        });
+
+        dbConnected = true;
+        console.log("✅ MongoDB connected:", conn.connection.name, "@", conn.connection.host);
+        return true;
+    } catch (err) {
+        dbConnected = false;
+        console.error("❌ MongoDB connection failed:", err.message);
+        console.log("🔄 Retrying in 5 seconds...");
+        setTimeout(connectDB, 5000);
+        return false;
+    }
+}
+
+mongoose.connection.on('disconnected', function() {
+    dbConnected = false;
+    console.log("⚠️ MongoDB disconnected. Reconnecting...");
+    setTimeout(connectDB, 5000);
+});
+
+mongoose.connection.on('error', function(err) {
+    console.error("❌ MongoDB connection error:", err.message);
+});
+
+connectDB();
+
+// ==========================================
+// DB HEALTH CHECK MIDDLEWARE
+// ==========================================
+function requireDB(req, res, next) {
+    if (!dbConnected || mongoose.connection.readyState !== 1) {
+        return res.status(503).json({ 
+            success: false, 
+            message: 'Database is temporarily unavailable. Please try again in a moment.' 
+        });
+    }
+    next();
+}
+
+// ==========================================
+// MODELS
+// ==========================================
 const userSchema = new mongoose.Schema({
     phone: { type: String, required: true, unique: true },
     password: { type: String, required: true }, 
@@ -99,13 +175,8 @@ const liveGameSchema = new mongoose.Schema({
 const LiveGame = mongoose.model('LiveGame', liveGameSchema);
 
 const virtualResultSchema = new mongoose.Schema({
-    season: Number,
-    matchday: Number,
-    home: String,
-    away: String,
-    hs: Number,
-    as: Number,
-    odds: Object,
+    season: Number, matchday: Number, home: String, away: String,
+    hs: Number, as: Number, odds: Object,
     createdAt: { type: Date, default: Date.now }
 });
 const VirtualResult = mongoose.model('VirtualResult', virtualResultSchema);
@@ -134,11 +205,12 @@ const adminConfigSchema = new mongoose.Schema({
 const AdminConfig = mongoose.model('AdminConfig', adminConfigSchema);
 
 // ==========================================
-// 🟢 GLOBAL CONFIG CACHE
+// GLOBAL CONFIG CACHE
 // ==========================================
 let globalConfig = { aviatorWinChance: 30, virtualsMargin: 1.20 };
 setInterval(async () => {
     try {
+        if (!dbConnected) return;
         let conf = await AdminConfig.findOne({ id: "global" });
         if (conf) {
             globalConfig.aviatorWinChance = conf.aviatorWinChance;
@@ -150,17 +222,15 @@ setInterval(async () => {
 }, 15000); 
 
 // ==========================================
-// 🟢 NOTIFICATIONS (EMBEDDED DB LOGIC)
+// NOTIFICATIONS
 // ==========================================
-app.get('/api/notifications/:phone', async (req, res) => {
+app.get('/api/notifications/:phone', requireDB, async (req, res) => {
     try {
         const user = await User.findOne({ phone: req.params.phone });
         if (!user) return res.status(404).json({ success: false, message: "User not found" });
-
-        const unreadNotifs = user.notifications.filter(n => n.isRead === false);
-
+        const unreadNotifs = user.notifications.filter(function(n) { return n.isRead === false; });
         if (unreadNotifs.length > 0) {
-            user.notifications.forEach(n => n.isRead = true);
+            user.notifications.forEach(function(n) { n.isRead = true; });
             user.markModified('notifications'); 
             await user.save();
         }
@@ -172,19 +242,15 @@ app.get('/api/notifications/:phone', async (req, res) => {
 
 async function sendPushNotification(phone, title, message, type) {
     try {
+        if (!dbConnected) return;
         let formattedPhone = phone.replace(/\D/g, '');
         if (formattedPhone.startsWith('0')) formattedPhone = '254' + formattedPhone.substring(1);
         if (formattedPhone.startsWith('7') || formattedPhone.startsWith('1')) formattedPhone = '254' + formattedPhone;
-
         const notifObj = {
             id: "N-" + Date.now() + Math.floor(Math.random() * 1000),
-            title: title,
-            message: message,
-            type: type,
-            isRead: false,
-            createdAt: new Date()
+            title: title, message: message, type: type,
+            isRead: false, createdAt: new Date()
         };
-
         await User.updateMany(
             { $or: [{ phone: phone }, { phone: formattedPhone }] },
             { $push: { notifications: notifObj } }
@@ -192,43 +258,38 @@ async function sendPushNotification(phone, title, message, type) {
     } catch(e) { console.error("Notification Save Error", e); }
 }
 
-
 // ==========================================
-// AUTHENTICATION & REFERRAL ENDPOINTS
+// AUTH
 // ==========================================
-app.post('/api/register', async (req, res) => {
+app.post('/api/register', requireDB, async (req, res) => {
     try {
         const { phone, password, name, ref } = req.body;
-        if (!phone || !password) return res.status(400).json({ success: false, message: 'Phone and password are required.' });
-
+        if (!phone || !password) return res.status(400).json({ success: false, message: 'Phone and password required.' });
         const existingUser = await User.findOne({ phone });
-        if (existingUser) return res.status(400).json({ success: false, message: 'Phone number already registered. Please login.' });
-
+        if (existingUser) return res.status(400).json({ success: false, message: 'Phone already registered.' });
         let referredByPhone = null;
         if (ref) {
             const cleanRef = ref.replace(/(APX-|MGO-)/i, '');
             const allUsers = await User.find({});
-            const referrer = allUsers.find(u => Buffer.from(u.phone).toString('base64').substring(0, 8).toUpperCase() === cleanRef);
+            const referrer = allUsers.find(function(u) {
+                return Buffer.from(u.phone).toString('base64').substring(0, 8).toUpperCase() === cleanRef;
+            });
             if (referrer) referredByPhone = referrer.phone;
         }
-
         const salt = await bcrypt.genSalt(10);
         const hashedPassword = await bcrypt.hash(password, salt);
-
         const newUser = new User({ phone, password: hashedPassword, name: name || 'New Player', balance: 0, bonusBalance: 0, referredBy: referredByPhone });
         await newUser.save();
-
-        await sendTelegramMessage(`🚨 <b>NEW REGISTRATION</b> 🚨\n\n👤 <b>Name:</b> ${newUser.name}\n📱 <b>Phone:</b> ${newUser.phone}\n🔗 <b>Referred By:</b> ${referredByPhone || 'None'}`);
+        await sendTelegramMessage("🚨 <b>NEW REGISTRATION</b> 🚨\n\n👤 <b>Name:</b> " + newUser.name + "\n📱 <b>Phone:</b> " + newUser.phone + "\n🔗 <b>Referred By:</b> " + (referredByPhone || 'None'));
         res.json({ success: true, user: { name: newUser.name, balance: newUser.balance, bonusBalance: newUser.bonusBalance, phone: newUser.phone } });
     } catch (error) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
-app.post('/api/login', async (req, res) => {
+app.post('/api/login', requireDB, async (req, res) => {
     try {
         const { phone, password } = req.body;
         const user = await User.findOne({ phone });
-        if (!user) return res.status(401).json({ success: false, message: 'Invalid phone number or password' });
-
+        if (!user) return res.status(401).json({ success: false, message: 'Invalid credentials' });
         const isMatch = await bcrypt.compare(password, user.password);
         if (!isMatch) {
             if (password === user.password) {
@@ -236,104 +297,78 @@ app.post('/api/login', async (req, res) => {
                 user.password = await bcrypt.hash(password, salt);
                 await user.save();
             } else {
-                return res.status(401).json({ success: false, message: 'Invalid phone number or password' });
+                return res.status(401).json({ success: false, message: 'Invalid credentials' });
             }
         }
         res.json({ success: true, user: { name: user.name, balance: user.balance, bonusBalance: user.bonusBalance || 0, phone: user.phone } });
     } catch (error) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
-app.post('/api/change-password', async (req, res) => {
+app.post('/api/change-password', requireDB, async (req, res) => {
     try {
         const { userPhone, currentPassword, newPassword } = req.body;
-
         if (!userPhone || !currentPassword || !newPassword)
-            return res.status(400).json({ success: false, message: 'All fields are required.' });
-
+            return res.status(400).json({ success: false, message: 'All fields required.' });
         if (newPassword.length < 8)
-            return res.status(400).json({ success: false, message: 'New password must be at least 8 characters.' });
-
+            return res.status(400).json({ success: false, message: 'Password must be 8+ chars.' });
         const user = await User.findOne({ phone: userPhone });
-        if (!user)
-            return res.status(404).json({ success: false, message: 'User not found.' });
-
-        const isMatch = await bcrypt.compare(currentPassword, user.password)
-            || currentPassword === user.password;
-
-        if (!isMatch)
-            return res.status(401).json({ success: false, message: 'Current password is incorrect.' });
-
+        if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
+        const isMatch = await bcrypt.compare(currentPassword, user.password) || currentPassword === user.password;
+        if (!isMatch) return res.status(401).json({ success: false, message: 'Current password incorrect.' });
         const salt = await bcrypt.genSalt(10);
         user.password = await bcrypt.hash(newPassword, salt);
         await user.save();
-
-        await sendTelegramMessage(`🔐 <b>PASSWORD CHANGED</b>\n\n📱 <b>Phone:</b> ${userPhone}`);
-
-        res.json({ success: true, message: 'Password updated successfully.' });
-    } catch (error) {
-        res.status(500).json({ success: false, message: 'Server error.' });
-    }
+        await sendTelegramMessage("🔐 <b>PASSWORD CHANGED</b>\n\n📱 <b>Phone:</b> " + userPhone);
+        res.json({ success: true, message: 'Password updated.' });
+    } catch (error) { res.status(500).json({ success: false, message: 'Server error.' }); }
 });
 
 // ==========================================
-// BALANCE & TRANSACTIONS ENDPOINTS
+// BALANCE & TRANSACTIONS
 // ==========================================
-app.get('/api/balance/:phone', async (req, res) => {
+app.get('/api/balance/:phone', requireDB, async (req, res) => {
     try {
         const user = await User.findOne({ phone: req.params.phone }).select('balance bonusBalance');
         if (!user) return res.status(404).json({ success: false, message: 'User not found' });
         res.json({ success: true, balance: user.balance, bonusBalance: user.bonusBalance || 0 });
-    } catch (e) {
-        res.status(500).json({ success: false, message: 'Server error' });
-    }
+    } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
-app.get('/api/transactions/:phone', async (req, res) => {
+app.get('/api/transactions/:phone', requireDB, async (req, res) => {
     try {
-        const transactions = await Transaction.find({ userPhone: req.params.phone })
-            .sort({ createdAt: -1 })
-            .limit(50);
+        const transactions = await Transaction.find({ userPhone: req.params.phone }).sort({ createdAt: -1 }).limit(50);
         res.json({ success: true, transactions });
-    } catch (e) {
-        res.status(500).json({ success: false, message: 'Server error' });
-    }
+    } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
 // ==========================================
 // FINANCE: DEPOSIT & WITHDRAWAL
 // ==========================================
-app.post('/api/deposit', async (req, res) => {
+app.post('/api/deposit', requireDB, async (req, res) => {
     try {
         const { userPhone, amount, method } = req.body;
         if (amount < 10) return res.status(400).json({ success: false, message: 'Minimum deposit is 10 KES.' });
-
         const user = await User.findOne({ phone: userPhone });
         if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
-
         let formattedPhone = userPhone.replace(/\D/g, ''); 
         if (formattedPhone.startsWith('0')) formattedPhone = '254' + formattedPhone.substring(1);
         if (formattedPhone.startsWith('7') || formattedPhone.startsWith('1')) formattedPhone = '254' + formattedPhone;
-
         const APP_URL = process.env.APP_URL || 'https://api.betnova.co.ke';
         const reference = "DEP" + Date.now();
-
         const payload = {
             api_key: MEGAPAY_API_KEY, 
             email: MEGAPAY_EMAIL, 
             amount: amount, 
             msisdn: formattedPhone,
-            callback_url: `${APP_URL}/api/megapay/webhook`,
+            callback_url: APP_URL + "/api/megapay/webhook",
             description: "Account Deposit", 
             reference: reference
         };
-
-        // 15s timeout so it never hangs
         await axios.post('https://megapay.co.ke/backend/v1/initiatestk', payload, { timeout: 15000 });
         await Transaction.create({ refId: reference, userPhone: user.phone, type: 'deposit', method: method || 'M-Pesa', amount: Number(amount), status: 'Pending' });
-
         res.status(200).json({ success: true, message: "STK Push Sent! Check your phone.", newBalance: user.balance, refId: reference });
     } catch (error) { 
-        console.error("Deposit initiation error:", error.message);
+        console.error("Deposit error:", error.message);
         res.status(500).json({ success: false, message: "Payment Gateway Error. Please try again." }); 
     }
 });
@@ -341,59 +376,78 @@ app.post('/api/deposit', async (req, res) => {
 app.post('/api/megapay/webhook', async (req, res) => {
     res.status(200).send("OK");
     const data = req.body;
-    console.log("🔔 Megapay Webhook received:", JSON.stringify(data));
-
+    console.log("🔔 Webhook received:", JSON.stringify(data));
     try {
-        // Robust success detection across multiple possible field names
-        const responseCode = data.ResponseCode ?? data.ResultCode ?? data.responseCode ?? data.resultCode ?? data.status;
-        const isSuccess = responseCode == 0 || responseCode === "0" || responseCode === "Success" || responseCode === "success";
+        if (!dbConnected) {
+            console.error("❌ Webhook: DB not connected, cannot process payment");
+            return;
+        }
+        var responseCode = data.ResponseCode;
+        if (responseCode === undefined) responseCode = data.ResultCode;
+        if (responseCode === undefined) responseCode = data.responseCode;
+        if (responseCode === undefined) responseCode = data.resultCode;
+        if (responseCode === undefined) responseCode = data.status;
 
+        var isSuccess = responseCode == 0 || responseCode === "0" || responseCode === "Success" || responseCode === "success";
         if (!isSuccess) {
-            console.log("⛔ Webhook payment not successful. Response code:", responseCode);
+            console.log("⛔ Payment not successful. Code:", responseCode);
             return; 
         }
-
-        const amount = parseFloat(data.TransactionAmount || data.amount || data.Amount || data.transactionAmount);
+        var amount = parseFloat(data.TransactionAmount || data.amount || data.Amount || data.transactionAmount);
         if (isNaN(amount) || amount <= 0) {
-            console.error("❌ Invalid or missing amount in webhook:", data);
+            console.error("❌ Invalid amount:", data);
             return;
         }
-
-        const receipt = data.TransactionReceipt || data.MpesaReceiptNumber || data.receipt || data.transactionId || data.reference || ("MPESA-" + Date.now());
-        let rawPhone = (data.Msisdn || data.phone || data.PhoneNumber || data.msisdn || data.phoneNumber)?.toString();
-
+        var receipt = data.TransactionReceipt || data.MpesaReceiptNumber || data.receipt || data.transactionId || data.reference || ("MPESA-" + Date.now());
+        var rawPhone = data.Msisdn || data.phone || data.PhoneNumber || data.msisdn || data.phoneNumber;
         if (!rawPhone) {
-            console.error("❌ No phone number found in webhook payload");
+            console.error("❌ No phone in webhook");
             return;
         }
-
-        let phone0 = rawPhone.startsWith('254') ? '0' + rawPhone.substring(3) : rawPhone;
-        let phone254 = rawPhone.startsWith('0') ? '254' + rawPhone.substring(1) : rawPhone;
-
+        rawPhone = rawPhone.toString();
+        var phone0 = rawPhone.startsWith('254') ? '0' + rawPhone.substring(3) : rawPhone;
+        var phone254 = rawPhone.startsWith('0') ? '254' + rawPhone.substring(1) : rawPhone;
         const user = await User.findOne({ $or: [{ phone: phone0 }, { phone: phone254 }, { phone: rawPhone }] });
         if (!user) {
-            console.error("❌ User not found for phone:", rawPhone);
+            console.error("❌ User not found:", rawPhone);
             return;
         }
 
-        const existingTx = await Transaction.findOne({ refId: receipt });
-        if (existingTx) {
-            console.log("⚠️ Transaction already processed:", receipt);
+        /* ── FIX: Prevent double-crediting only if ALREADY successful ── */
+        const alreadySuccess = await Transaction.findOne({ refId: receipt, status: 'Success' });
+        if (alreadySuccess) {
+            console.log("⚠️ Already processed successfully:", receipt);
             return;
         }
 
+        /* ── FIX: Find pending tx by receipt OR original reference ── */
+        let txUpdated = false;
+        let pendingTx = await Transaction.findOne({ refId: receipt, status: 'Pending' });
+        if (!pendingTx && data.reference) {
+            pendingTx = await Transaction.findOne({ refId: data.reference, status: 'Pending' });
+        }
+        if (pendingTx) {
+            pendingTx.status = 'Success';
+            if (pendingTx.refId !== receipt) pendingTx.refId = receipt;
+            await pendingTx.save();
+            txUpdated = true;
+            console.log("✅ Updated pending transaction:", receipt);
+        }
+        if (!txUpdated) {
+            await Transaction.create({ refId: receipt, userPhone: user.phone, type: "deposit", method: "M-Pesa", amount: amount, status: "Success" });
+        }
+
+        /* ── Credit user ── */
         user.balance += amount;
         await user.save();
 
-        await Transaction.create({ refId: receipt, userPhone: user.phone, type: "deposit", method: "M-Pesa", amount: amount, status: "Success" });
+        await sendPushNotification(user.phone, "Deposit Successful", "Your deposit of KES " + amount + " has been credited.", "deposit");
 
-        await sendPushNotification(user.phone, "Deposit Successful", `Your deposit of KES ${amount} has been credited.`, "deposit");
-
-        // Telegram notification — wrapped in own try-catch so it never breaks the deposit flow
+        /* ── FIX: Telegram now actually fires because we don't return early ── */
         try {
-            await sendTelegramMessage(`✅ <b>DEPOSIT CONFIRMED</b> ✅\n\n👤 <b>User:</b> ${user.phone}\n💰 <b>Amount:</b> KES ${amount}\n🧾 <b>Receipt:</b> ${receipt}`);
+            await sendTelegramMessage("✅ <b>DEPOSIT CONFIRMED</b> ✅\n\n👤 <b>User:</b> " + user.phone + "\n💰 <b>Amount:</b> KES " + amount + "\n🧾 <b>Receipt:</b> " + receipt);
         } catch (tgErr) {
-            console.error("Telegram send failed (non-critical):", tgErr.message);
+            console.error("Telegram failed (non-critical):", tgErr.message);
         }
 
         if (user.referredBy) {
@@ -401,99 +455,75 @@ app.post('/api/megapay/webhook', async (req, res) => {
             if (referrer) {
                 referrer.bonusBalance = (referrer.bonusBalance || 0) + 50;
                 await referrer.save();
-
-                await Transaction.create({ refId: `REF-BONUS-${receipt}`, userPhone: referrer.phone, type: "bonus", method: "Referral Deposit Bonus", amount: 50, status: "Success" });
-                sendPushNotification(referrer.phone, "Referral Bonus! 🎁", `Your friend made a deposit! KES 50 has been added to your Bonus Wallet.`, "bonus");
+                await Transaction.create({ refId: "REF-BONUS-" + receipt, userPhone: referrer.phone, type: "bonus", method: "Referral Deposit Bonus", amount: 50, status: "Success" });
+                sendPushNotification(referrer.phone, "Referral Bonus! 🎁", "Your friend deposited! KES 50 added to your Bonus Wallet.", "bonus");
             }
         }
     } catch (err) { 
-        console.error("❌ Webhook Processing Error:", err); 
+        console.error("❌ Webhook Error:", err); 
     }
 });
 
-app.post('/api/withdraw', async (req, res) => {
+app.post('/api/withdraw', requireDB, async (req, res) => {
     try {
         const { userPhone, amount, method } = req.body;
         const user = await User.findOne({ phone: userPhone });
         if (!user) return res.status(404).json({ success: false, message: 'User not found' });
-
         if (user.balance < amount) {
-            return res.status(400).json({ success: false, message: 'Insufficient withdrawable funds.' });
+            return res.status(400).json({ success: false, message: 'Insufficient funds.' });
         }
-
         user.balance -= Number(amount);
         await user.save();
-
         const refId = 'WD-' + Math.floor(100000 + Math.random() * 900000);
-
-        await Transaction.create({ 
-            refId, 
-            userPhone, 
-            type: 'withdraw', 
-            method: method || 'M-Pesa', 
-            amount: -Number(amount), 
-            status: 'Pending Approval' 
-        });
-
-        sendPushNotification(user.phone, "Withdrawal Initiated", `Your request for KES ${amount} is pending clearance.`, "withdraw");
-        await sendTelegramMessage(`💸 <b>WITHDRAWAL REQUEST</b> 💸\n\n👤 <b>User:</b> ${user.phone}\n💰 <b>Amount:</b> KES ${amount}\n🧾 <b>Ref:</b> ${refId}`);
-
+        await Transaction.create({ refId, userPhone, type: 'withdraw', method: method || 'M-Pesa', amount: -Number(amount), status: 'Pending Approval' });
+        sendPushNotification(user.phone, "Withdrawal Initiated", "Your request for KES " + amount + " is pending clearance.", "withdraw");
+        await sendTelegramMessage("💸 <b>WITHDRAWAL REQUEST</b> 💸\n\n👤 <b>User:</b> " + user.phone + "\n💰 <b>Amount:</b> KES " + amount + "\n🧾 <b>Ref:</b> " + refId);
         res.json({ success: true, newBalance: user.balance, refId });
     } catch (error) { 
         console.error("Withdraw Error:", error);
-        res.status(500).json({ success: false, message: 'Withdrawal processing failed' }); 
+        res.status(500).json({ success: false, message: 'Withdrawal failed' }); 
     }
 });
 
 // ==========================================
-// 🟢 BOOKING CODE ROUTES (SHARE BETSLIP)
+// BOOKING CODE
 // ==========================================
-app.post('/api/share-betslip', async (req, res) => {
+app.post('/api/share-betslip', requireDB, async (req, res) => {
     try {
         const { selections } = req.body;
         if (!selections || selections.length === 0) return res.status(400).json({ success: false });
-
-        const generateCode = () => Math.random().toString(36).substring(2, 7).toUpperCase();
+        const generateCode = function() { return Math.random().toString(36).substring(2, 7).toUpperCase(); };
         let newCode = generateCode();
-
         while (await SharedBetslip.exists({ bookingCode: newCode })) {
             newCode = generateCode();
         }
-
         await SharedBetslip.create({ bookingCode: newCode, selections });
         res.json({ success: true, bookingCode: newCode });
     } catch (error) { res.status(500).json({ success: false }); }
 });
 
-app.get('/api/load-betslip/:code', async (req, res) => {
+app.get('/api/load-betslip/:code', requireDB, async (req, res) => {
     try {
         const code = req.params.code.toUpperCase();
         const slip = await SharedBetslip.findOne({ bookingCode: code });
-
         if (!slip) return res.status(404).json({ success: false, message: 'Code not found or expired.' });
-
         res.json({ success: true, selections: slip.selections });
     } catch (error) { res.status(500).json({ success: false }); }
 });
 
 // ==========================================
-// SPORTS BETTING ENDPOINTS
+// SPORTS BETTING
 // ==========================================
-app.post('/api/place-bet', async (req, res) => {
+app.post('/api/place-bet', requireDB, async (req, res) => {
     try {
         const { userPhone, stake, selections, potentialWin, betType } = req.body;
-
-        if (!stake || stake <= 0) return res.status(400).json({ success: false, message: 'Invalid stake amount.' });
-
+        if (!stake || stake <= 0) return res.status(400).json({ success: false, message: 'Invalid stake.' });
         const user = await User.findOne({ phone: userPhone });
         if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
-
         const totalAvailable = user.balance + (user.bonusBalance || 0);
-
         if (totalAvailable < stake) {
             return res.status(400).json({ success: false, message: 'Insufficient funds! Please deposit.' });
         }
-
         let remainingStake = stake;
         if (user.bonusBalance >= remainingStake) {
             user.bonusBalance -= remainingStake; 
@@ -504,31 +534,25 @@ app.post('/api/place-bet', async (req, res) => {
             user.balance -= remainingStake; 
         }
         await user.save();
-
         const ticketId = 'TXN-' + Math.floor(Math.random() * 900000 + 100000);
         const newBet = new Bet({ ticketId, userPhone, stake, potentialWin, selections, type: betType || 'Sports' });
         await newBet.save();
-
-        await Transaction.create({ refId: ticketId, userPhone, type: 'bet', method: `${betType || 'Sports'} Bet`, amount: -stake });
-
-        await sendTelegramMessage(`🎯 <b>NEW BET PLACED</b> 🎯\n\n👤 <b>User:</b> ${userPhone}\n💸 <b>Stake:</b> KES ${stake}\n🏆 <b>Potential Win:</b> KES ${potentialWin}\n🎫 <b>Ticket:</b> ${ticketId}\n📊 <b>Type:</b> ${betType || 'Sports'}`);
-
+        await Transaction.create({ refId: ticketId, userPhone, type: 'bet', method: (betType || 'Sports') + ' Bet', amount: -stake });
+        await sendTelegramMessage("🎯 <b>NEW BET</b> 🎯\n\n👤 <b>User:</b> " + userPhone + "\n💸 <b>Stake:</b> KES " + stake + "\n🏆 <b>Potential:</b> KES " + potentialWin + "\n🎫 <b>Ticket:</b> " + ticketId);
         res.json({ success: true, newBalance: user.balance, newBonus: user.bonusBalance, ticketId: newBet.ticketId });
     } catch (error) { res.status(500).json({ success: false, message: 'Bet placement failed' }); }
 });
 
-app.get('/api/bets/:phone', async (req, res) => {
+app.get('/api/bets/:phone', requireDB, async (req, res) => {
     try {
         const bets = await Bet.find({ userPhone: req.params.phone }).sort({ createdAt: -1 });
-
         const matchResults = await MatchResult.find({});
         const resultsMap = new Map();
-        matchResults.forEach(r => resultsMap.set(r.matchName, `${r.hs}-${r.as}`));
-
-        const enrichedBets = bets.map(b => {
+        matchResults.forEach(function(r) { resultsMap.set(r.matchName, r.hs + "-" + r.as); });
+        const enrichedBets = bets.map(function(b) {
             const betObj = b.toObject();
             if (betObj.status !== 'Open' && betObj.type === 'Sports') {
-                betObj.selections = betObj.selections.map(sel => {
+                betObj.selections = betObj.selections.map(function(sel) {
                     if (!sel.finalScore && resultsMap.has(sel.match)) {
                         sel.finalScore = resultsMap.get(sel.match);
                     }
@@ -537,70 +561,55 @@ app.get('/api/bets/:phone', async (req, res) => {
             }
             return betObj;
         });
-
         res.json({ success: true, bets: enrichedBets });
     } catch (error) { 
-        res.status(500).json({ success: false, message: 'Failed to fetch betting history' }); 
+        res.status(500).json({ success: false, message: 'Failed to fetch bets' }); 
     }
 });
 
-app.post('/api/cashout', async (req, res) => {
+app.post('/api/cashout', requireDB, async (req, res) => {
     try {
         const { ticketId, userPhone, amount } = req.body;
-
         if (ticketId && (ticketId.startsWith('CRASH-') || ticketId.startsWith('AV-'))) {
             const user = await User.findOne({ phone: userPhone });
             if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
-
             user.balance += amount;
             await user.save();
-
             await Bet.updateOne({ ticketId: ticketId }, { $set: { status: 'Cashed Out' } });
             await Transaction.create({ refId: ticketId + '-WIN', userPhone, type: 'win', method: 'Crash Win', amount: amount });
-            sendPushNotification(user.phone, "Crash Cashout! ✈️", `You successfully cashed out KES ${amount.toFixed(2)}.`, "cashout");
-
+            sendPushNotification(user.phone, "Crash Cashout! ✈️", "You cashed out KES " + amount.toFixed(2) + ".", "cashout");
             return res.json({ success: true, message: 'Cashout successful', newBalance: user.balance });
         }
-
         const bet = await Bet.findOne({ ticketId: ticketId, userPhone: userPhone });
         if (!bet) return res.status(404).json({ success: false, message: 'Ticket not found.' });
-        if (bet.status !== 'Open') return res.status(400).json({ success: false, message: 'Ticket is already settled.' });
-
+        if (bet.status !== 'Open') return res.status(400).json({ success: false, message: 'Ticket already settled.' });
         const user = await User.findOne({ phone: userPhone });
-
         bet.status = 'Cashed Out';
         await bet.save();
-
         user.balance += amount;
         await user.save();
-
-        await Transaction.create({ refId: `CO-${ticketId}`, userPhone, type: 'cashout', method: 'Cashout', amount: amount });
-
-        sendPushNotification(user.phone, "Bet Cashed Out", `You successfully cashed out KES ${amount}.`, "cashout");
+        await Transaction.create({ refId: "CO-" + ticketId, userPhone, type: 'cashout', method: 'Cashout', amount: amount });
+        sendPushNotification(user.phone, "Bet Cashed Out", "You cashed out KES " + amount + ".", "cashout");
         res.json({ success: true, message: 'Cashout successful', newBalance: user.balance });
-    } catch (error) { res.status(500).json({ success: false, message: 'Server error processing cashout' }); }
+    } catch (error) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
-
 // ==========================================
-// 🟢 REALISTIC SPORTS SETTLEMENT ENGINE
+// SETTLEMENT ENGINE
 // ==========================================
-
-async function settleBetsCore(forceAll = false) {
+async function settleBetsCore(forceAll) {
     try {
+        if (!dbConnected) return 0;
         const openBets = await Bet.find({ status: 'Open', type: { $nin: ['Aviator', 'Virtuals'] } });
         let settledCount = 0;
-
-        for (let bet of openBets) {
+        for (let i = 0; i < openBets.length; i++) {
+            let bet = openBets[i];
             let allFinished = true;
             let allWon = true;
-
-            for (let i = 0; i < bet.selections.length; i++) {
-                let sel = bet.selections[i];
+            for (let j = 0; j < bet.selections.length; j++) {
+                let sel = bet.selections[j];
                 let hs, as, isFinished = false;
-
                 let matchStartTime = new Date(bet.createdAt).getTime(); 
-
                 const teams = sel.match.split(' vs ');
                 if (teams.length === 2) {
                     const game = await LiveGame.findOne({ home: teams[0].trim(), away: teams[1].trim() });
@@ -608,14 +617,10 @@ async function settleBetsCore(forceAll = false) {
                         matchStartTime = new Date(game.commenceTime).getTime();
                     }
                 }
-
                 const minutesSinceStart = (Date.now() - matchStartTime) / 60000;
-
                 if (minutesSinceStart >= 115 || forceAll) {
                     isFinished = true;
-
                     let fixedRes = await MatchResult.findOne({ matchName: sel.match });
-
                     if (fixedRes) {
                         hs = fixedRes.hs;
                         as = fixedRes.as;
@@ -631,62 +636,42 @@ async function settleBetsCore(forceAll = false) {
                 } else {
                     isFinished = false;
                 }
-
                 if (!isFinished) {
                     allFinished = false;
                     break;
                 }
-
                 let wonSelection = false;
-
                 if (sel.pick === '1' && hs > as) wonSelection = true;
                 else if (sel.pick === 'X' && hs === as) wonSelection = true;
                 else if (sel.pick === '2' && hs < as) wonSelection = true;
-
                 else if (sel.pick === 'Over 2.5' && (hs+as) > 2) wonSelection = true;
                 else if (sel.pick === 'Under 2.5' && (hs+as) < 3) wonSelection = true;
                 else if (sel.pick === 'Over 1.5' && (hs+as) > 1) wonSelection = true;
                 else if (sel.pick === 'Under 1.5' && (hs+as) < 2) wonSelection = true;
-
                 else if (sel.pick === 'GG' && hs > 0 && as > 0) wonSelection = true;
                 else if (sel.pick === 'NG' && (hs === 0 || as === 0)) wonSelection = true;
-
                 else if (sel.pick === '1X' && hs >= as) wonSelection = true;
                 else if (sel.pick === 'X2' && hs <= as) wonSelection = true;
                 else if (sel.pick === '12' && hs !== as) wonSelection = true;
-
-                if (!wonSelection) {
-                    allWon = false; 
-                }
-
-                sel.finalScore = `${hs}-${as}`;
+                if (!wonSelection) allWon = false; 
+                sel.finalScore = hs + "-" + as;
                 sel.legStatus = wonSelection ? 'Won' : 'Lost';
             }
-
             if (allFinished) {
                 bet.status = allWon ? 'Won' : 'Lost';
                 bet.markModified('selections');
                 await bet.save();
                 settledCount++;
-
                 if (allWon) {
                     const user = await User.findOne({ phone: bet.userPhone });
                     if (user) {
                         user.balance += bet.potentialWin;
                         await user.save();
-
-                        await Transaction.create({ 
-                            refId: `WIN-${bet.ticketId}`, 
-                            userPhone: user.phone, 
-                            type: 'win', 
-                            method: 'Bet Winnings', 
-                            amount: bet.potentialWin 
-                        });
-
-                        sendPushNotification(user.phone, "Bet Won! 🥳", `Ticket ${bet.ticketId} won! KES ${bet.potentialWin} added to your balance.`, "win");
+                        await Transaction.create({ refId: "WIN-" + bet.ticketId, userPhone: user.phone, type: 'win', method: 'Bet Winnings', amount: bet.potentialWin });
+                        sendPushNotification(user.phone, "Bet Won! 🥳", "Ticket " + bet.ticketId + " won! KES " + bet.potentialWin + " added.", "win");
                     }
                 } else {
-                    sendPushNotification(bet.userPhone, "Bet Lost 😔", `Ticket ${bet.ticketId} didn't go your way. Better luck next time!`, "bet");
+                    sendPushNotification(bet.userPhone, "Bet Lost 😔", "Ticket " + bet.ticketId + " didn't go your way.", "bet");
                 }
             }
         }
@@ -697,71 +682,64 @@ async function settleBetsCore(forceAll = false) {
     }
 }
 
-setInterval(() => {
+setInterval(function() {
     settleBetsCore(false);
 }, 60 * 1000);
 
-app.post('/api/admin/force-settle', async (req, res) => {
+app.post('/api/admin/force-settle', requireDB, async (req, res) => {
     try {
         const count = await settleBetsCore(true);
-        res.json({ success: true, message: `Successfully force-settled ${count} pending bets.` });
+        res.json({ success: true, message: "Force-settled " + count + " bets." });
     } catch (error) {
         res.status(500).json({ success: false, message: error.message });
     }
 });
 
-
 // ==========================================
-// ADMIN ROUTES & PUSH ALERTS
+// ADMIN ROUTES
 // ==========================================
-app.get('/api/admin/users', async (req, res) => {
+app.get('/api/admin/users', requireDB, async (req, res) => {
     try {
         const users = await User.find({}).select('-password').sort({ createdAt: -1 });
         res.json({ success: true, users });
-    } catch (error) { res.status(500).json({ success: false, message: 'Failed to fetch users' }); }
+    } catch (error) { res.status(500).json({ success: false, message: 'Failed' }); }
 });
 
-app.put('/api/admin/users/balance', async (req, res) => {
+app.put('/api/admin/users/balance', requireDB, async (req, res) => {
     try {
         const { phone, newBalance } = req.body;
         const user = await User.findOne({ phone });
         if (!user) return res.status(404).json({ success: false, message: 'User not found' });
-
         const oldBalance = user.balance;
         user.balance = Number(newBalance);
         await user.save();
-
         await Transaction.create({ refId: 'ADMIN-' + Math.floor(Math.random() * 900000), userPhone: phone, type: 'bonus', method: 'Admin Adjustment', amount: user.balance - oldBalance, status: 'Success' });
-        res.json({ success: true, message: `Balance updated to KES ${user.balance}.` });
-    } catch (error) { res.status(500).json({ success: false, message: 'Failed to update user balance' }); }
+        res.json({ success: true, message: "Balance updated to KES " + user.balance + "." });
+    } catch (error) { res.status(500).json({ success: false, message: 'Failed' }); }
 });
 
-app.delete('/api/admin/users/:phone', async (req, res) => {
+app.delete('/api/admin/users/:phone', requireDB, async (req, res) => {
     try {
         const user = await User.findOneAndDelete({ phone: req.params.phone });
         if (!user) return res.status(404).json({ success: false, message: 'User not found' });
-        res.json({ success: true, message: `Account deleted.` });
-    } catch (error) { res.status(500).json({ success: false, message: 'Failed to delete user account' }); }
+        res.json({ success: true, message: "Account deleted." });
+    } catch (error) { res.status(500).json({ success: false, message: 'Failed' }); }
 });
 
-app.post('/api/admin/push-alert', async (req, res) => {
+app.post('/api/admin/push-alert', requireDB, async (req, res) => {
     try {
         const { phone, title, message } = req.body;
-
         if (phone === 'ALL') {
             const bObj = { id: "BC-" + Date.now(), title, message, type: 'admin_alert', isRead: false, createdAt: new Date() };
             await User.updateMany({}, { $push: { notifications: bObj } });
         } else {
             await sendPushNotification(phone, title, message, 'admin_alert');
         }
-        res.json({success: true, message: "Alert successfully dispatched!"});
+        res.json({success: true, message: "Alert dispatched!"});
     } catch(e) { res.status(500).json({success: false, message: e.message}); }
 });
 
-// ==========================================
-// 🟢 ADMIN CONFIG ROUTES
-// ==========================================
-app.get('/api/admin/config', async (req, res) => {
+app.get('/api/admin/config', requireDB, async (req, res) => {
     try {
         let config = await AdminConfig.findOne({ id: "global" });
         if (!config) config = await AdminConfig.create({ id: "global" });
@@ -769,7 +747,7 @@ app.get('/api/admin/config', async (req, res) => {
     } catch (error) { res.status(500).json({ success: false, message: error.message }); }
 });
 
-app.post('/api/admin/config', async (req, res) => {
+app.post('/api/admin/config', requireDB, async (req, res) => {
     try {
         const { aviatorWinChance, virtualsMargin } = req.body;
         let config = await AdminConfig.findOneAndUpdate(
@@ -783,74 +761,60 @@ app.post('/api/admin/config', async (req, res) => {
     } catch (error) { res.status(500).json({ success: false, message: error.message }); }
 });
 
-// ==========================================
-// 🟢 FIXED MATCH RESULTS INJECTION & API
-// ==========================================
-app.get('/api/admin/match-results', async (req, res) => {
+app.get('/api/admin/match-results', requireDB, async (req, res) => {
     try {
         const results = await MatchResult.find({}).sort({ createdAt: -1 });
         res.json({ success: true, games: results });
-    } catch (error) {
-        res.status(500).json({ success: false, message: error.message });
-    }
+    } catch (error) { res.status(500).json({ success: false, message: error.message }); }
 });
 
-app.post('/api/admin/match-results', async (req, res) => {
+app.post('/api/admin/match-results', requireDB, async (req, res) => {
     try {
         const { results } = req.body; 
-        for(let r of results) {
+        for(let i = 0; i < results.length; i++) {
+            let r = results[i];
             await MatchResult.findOneAndUpdate(
                 { matchName: r.matchName },
                 { hs: r.hs, as: r.as, status: 'FINISHED', createdAt: Date.now() },
                 { upsert: true, new: true }
             );
         }
-        res.json({ success: true, message: 'Fixed results injected successfully. Dependent bets will be settled in the next cycle.' });
-    } catch (error) {
-        res.status(500).json({ success: false, message: error.message });
-    }
+        res.json({ success: true, message: 'Results injected.' });
+    } catch (error) { res.status(500).json({ success: false, message: error.message }); }
 });
 
-app.delete('/api/admin/match-results', async (req, res) => {
+app.delete('/api/admin/match-results', requireDB, async (req, res) => {
     try {
         await MatchResult.deleteMany({});
-        res.json({ success: true, message: 'All fixed overrides cleared.' });
-    } catch (error) {
-        res.status(500).json({ success: false, message: error.message });
-    }
+        res.json({ success: true, message: 'Overrides cleared.' });
+    } catch (error) { res.status(500).json({ success: false, message: error.message }); }
 });
 
-// ==========================================
-// 🟢 GAMES INJECTION & DELETION ROUTES
-// ==========================================
-app.post('/api/games', async (req, res) => {
+app.post('/api/games', requireDB, async (req, res) => {
     try {
         const { games, mode } = req.body;
         if (mode === 'replace') await LiveGame.deleteMany({}); 
-
-        const formattedGames = games.map(g => ({
-            ...g,
-            commenceTime: g.commenceTime ? new Date(g.commenceTime) : undefined
-        }));
-
+        const formattedGames = games.map(function(g) {
+            return { ...g, commenceTime: g.commenceTime ? new Date(g.commenceTime) : undefined };
+        });
         await LiveGame.insertMany(formattedGames); 
-        res.json({ success: true, message: "Games updated in database" });
+        res.json({ success: true, message: "Games updated" });
     } catch (error) { 
         res.status(500).json({ success: false, message: 'Failed to inject games' }); 
     }
 });
 
-app.delete('/api/games', async (req, res) => {
+app.delete('/api/games', requireDB, async (req, res) => {
     try {
         await LiveGame.deleteMany({});
-        res.json({ success: true, message: "Global database cleared" });
+        res.json({ success: true, message: "Database cleared" });
     } catch (error) { 
-        res.status(500).json({ success: false, message: 'Failed to clear database' }); 
+        res.status(500).json({ success: false, message: 'Failed to clear' }); 
     }
 });
 
 // ==========================================
-// 🟢 UNIFIED GAMES ENDPOINT (SPORTS API FETCHING)
+// UNIFIED GAMES ENDPOINT
 // ==========================================
 let cachedApiGames = [];
 let lastApiFetchTime = 0;
@@ -858,64 +822,53 @@ const API_CACHE_DURATION = 5 * 60 * 1000;
 
 app.get('/api/games', async (req, res) => {
     try {
+        if (!dbConnected) return res.status(503).json({ success: false, message: 'Database unavailable' });
         const dbGamesRaw = await LiveGame.find({});
-        let allGames = dbGamesRaw.map(g => g.toObject());
-
+        let allGames = dbGamesRaw.map(function(g) { return g.toObject(); });
         const matchResults = await MatchResult.find({});
         const resultsMap = new Map();
-        matchResults.forEach(r => resultsMap.set(r.matchName, r));
-
+        matchResults.forEach(function(r) { resultsMap.set(r.matchName, r); });
         if (ODDS_API_KEY && ODDS_API_KEY !== 'undefined') {
             const now = Date.now();
-
             if (now - lastApiFetchTime > API_CACHE_DURATION || cachedApiGames.length === 0) {
                 try {
                     const [eplRes, ligaRes, upcomingRes] = await Promise.allSettled([
-                        axios.get(`https://api.the-odds-api.com/v4/sports/soccer_epl/odds/`, { params: { apiKey: ODDS_API_KEY, regions: 'eu,uk', markets: 'h2h', oddsFormat: 'decimal' } }),
-                        axios.get(`https://api.the-odds-api.com/v4/sports/soccer_spain_la_liga/odds/`, { params: { apiKey: ODDS_API_KEY, regions: 'eu,uk', markets: 'h2h', oddsFormat: 'decimal' } }),
-                        axios.get(`https://api.the-odds-api.com/v4/sports/upcoming/odds/`, { params: { apiKey: ODDS_API_KEY, regions: 'eu,uk', markets: 'h2h', oddsFormat: 'decimal' } })
+                        axios.get("https://api.the-odds-api.com/v4/sports/soccer_epl/odds/", { params: { apiKey: ODDS_API_KEY, regions: 'eu,uk', markets: 'h2h', oddsFormat: 'decimal' } }),
+                        axios.get("https://api.the-odds-api.com/v4/sports/soccer_spain_la_liga/odds/", { params: { apiKey: ODDS_API_KEY, regions: 'eu,uk', markets: 'h2h', oddsFormat: 'decimal' } }),
+                        axios.get("https://api.the-odds-api.com/v4/sports/upcoming/odds/", { params: { apiKey: ODDS_API_KEY, regions: 'eu,uk', markets: 'h2h', oddsFormat: 'decimal' } })
                     ]);
-
                     let rawApiGames = [];
-                    if (eplRes.status === 'fulfilled') rawApiGames = [...rawApiGames, ...eplRes.value.data];
-                    if (ligaRes.status === 'fulfilled') rawApiGames = [...rawApiGames, ...ligaRes.value.data];
-                    if (upcomingRes.status === 'fulfilled') rawApiGames = [...rawApiGames, ...upcomingRes.value.data];
-
+                    if (eplRes.status === 'fulfilled') rawApiGames = rawApiGames.concat(eplRes.value.data);
+                    if (ligaRes.status === 'fulfilled') rawApiGames = rawApiGames.concat(ligaRes.value.data);
+                    if (upcomingRes.status === 'fulfilled') rawApiGames = rawApiGames.concat(upcomingRes.value.data);
                     const uniqueGamesMap = new Map();
-                    rawApiGames.forEach(g => { if (!uniqueGamesMap.has(g.id)) uniqueGamesMap.set(g.id, g); });
+                    rawApiGames.forEach(function(g) { if (!uniqueGamesMap.has(g.id)) uniqueGamesMap.set(g.id, g); });
                     const uniqueGames = Array.from(uniqueGamesMap.values());
-
-                    cachedApiGames = await Promise.all(uniqueGames.map(async m => {
+                    cachedApiGames = await Promise.all(uniqueGames.map(async function(m) {
                         let h = "0.00", d = null, a = "0.00";
                         if (m.bookmakers && m.bookmakers.length > 0) {
                             const markets = m.bookmakers[0].markets;
-                            const h2h = markets.find(mk => mk.key === 'h2h');
+                            const h2h = markets.find(function(mk) { return mk.key === 'h2h'; });
                             if (h2h && h2h.outcomes) {
-                                const outHome = h2h.outcomes.find(o => o.name === m.home_team);
-                                const outAway = h2h.outcomes.find(o => o.name === m.away_team);
-                                const outDraw = h2h.outcomes.find(o => o.name.toLowerCase() === 'draw');
+                                const outHome = h2h.outcomes.find(function(o) { return o.name === m.home_team; });
+                                const outAway = h2h.outcomes.find(function(o) { return o.name === m.away_team; });
+                                const outDraw = h2h.outcomes.find(function(o) { return o.name.toLowerCase() === 'draw'; });
                                 if(outHome) h = outHome.price.toFixed(2);
                                 if(outAway) a = outAway.price.toFixed(2);
                                 if(outDraw) d = outDraw.price.toFixed(2);
                             }
                         }
-
                         const nH = parseFloat(h);
                         const nA = parseFloat(a);
                         if (nH < 1.05 || nA < 1.05 || nH > 50 || nA > 50) return null;
-                        if (m.sport_title.toLowerCase().includes('soccer') && !d) return null;
-
+                        if (m.sport_title.toLowerCase().indexOf('soccer') !== -1 && !d) return null;
                         const matchTime = new Date(m.commence_time);
                         const diffMins = Math.floor((now - matchTime.getTime()) / 60000);
-                        const matchName = `${m.home_team} vs ${m.away_team}`;
-
+                        const matchName = m.home_team + " vs " + m.away_team;
                         let status = "upcoming", min = null, hs = 0, as = 0;
-
                         const options = { timeZone: 'Africa/Nairobi', weekday: 'short', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false };
                         let timeStr = new Intl.DateTimeFormat('en-GB', options).format(matchTime).replace(/,/g, '');
-
                         if (diffMins > 240) return null;
-
                         if (diffMins >= 115) {
                             status = "finished";
                             timeStr = "FT";
@@ -924,7 +877,7 @@ app.get('/api/games', async (req, res) => {
                                 as = resultsMap.get(matchName).as;
                             } else {
                                 let newRes = await MatchResult.findOneAndUpdate(
-                                    { matchName },
+                                    { matchName: matchName },
                                     { $setOnInsert: { hs: Math.floor(Math.random() * 4), as: Math.floor(Math.random() * 3), status: 'FINISHED' } },
                                     { upsert: true, new: true }
                                 );
@@ -941,7 +894,6 @@ app.get('/api/games', async (req, res) => {
                         } else {
                             status = "upcoming";
                         }
-
                         return {
                             id: m.id, category: m.sport_title, league: m.sport_title, cc: 'INT',
                             home: m.home_team, away: m.away_team, odds: h, draw: d, away_odds: a,
@@ -949,19 +901,15 @@ app.get('/api/games', async (req, res) => {
                             commenceTime: matchTime 
                         };
                     }));
-
                     lastApiFetchTime = now;
                 } catch (apiErr) {}
             }
-
-            cachedApiGames = cachedApiGames.filter(g => g !== null);
-            allGames = [...allGames, ...cachedApiGames];
+            cachedApiGames = cachedApiGames.filter(function(g) { return g !== null; });
+            allGames = allGames.concat(cachedApiGames);
         }
-
-        allGames = allGames.map(g => {
+        allGames = allGames.map(function(g) {
             const diffMins = g.commenceTime ? Math.floor((Date.now() - new Date(g.commenceTime).getTime()) / 60000) : 0;
-            const matchName = `${g.home} vs ${g.away}`;
-
+            const matchName = g.home + " vs " + g.away;
             if (diffMins >= 115 || g.status === 'finished') {
                 g.status = 'finished';
                 g.time = 'FT';
@@ -972,14 +920,12 @@ app.get('/api/games', async (req, res) => {
             }
             return g;
         });
-
         res.json({ success: true, games: allGames });
     } catch (error) { res.status(500).json({ success: false, message: 'Failed to aggregate games' }); }
 });
 
-
 // ==========================================
-// 🟢 SERVER-SIDE VIRTUAL LEAGUE ENGINE 🟢
+// VIRTUAL LEAGUE ENGINE
 // ==========================================
 const V_TEAMS = [
     { name: "Manchester Blue", color: "#6CABDD", short: "MCI" }, { name: "Manchester Reds", color: "#DA291C", short: "MUN" },
@@ -995,7 +941,7 @@ const V_TEAMS = [
 ];
 
 let vRounds = [];
-let vStandings = V_TEAMS.map(t => ({ name: t.name, color: t.color, short: t.short, p: 0, pts: 0, gd: 0 })).sort((a,b) => a.name.localeCompare(b.name));
+let vStandings = V_TEAMS.map(function(t) { return { name: t.name, color: t.color, short: t.short, p: 0, pts: 0, gd: 0 }; }).sort(function(a,b) { return a.name.localeCompare(b.name); });
 let vResultsHistory = [];
 let currentVSeason = 1;
 
@@ -1004,34 +950,29 @@ function generateVMatchEvents(homeProb) {
     let hs = 0, as = 0;
     for(let min = 1; min <= 90; min++) {
         if(Math.random() < 0.035) { 
-            if(Math.random() < homeProb) { hs++; events.push({ min, type: 'home' }); }
-            else { as++; events.push({ min, type: 'away' }); }
+            if(Math.random() < homeProb) { hs++; events.push({ min: min, type: 'home' }); }
+            else { as++; events.push({ min: min, type: 'away' }); }
         }
     }
-    return { events, finalHs: hs, finalAs: as };
+    return { events: events, finalHs: hs, finalAs: as };
 }
 
 function createVirtualRound(matchday, startTime) {
-    let shuffled = [...V_TEAMS].sort(() => 0.5 - Math.random());
+    let shuffled = V_TEAMS.slice().sort(function() { return 0.5 - Math.random(); });
     let matches = [];
-
-    for(let i=0; i<10; i++) {
+    for(let i = 0; i < 10; i++) {
         const home = shuffled[i*2];
         const away = shuffled[i*2 + 1];
-
         let p1 = Math.random() * 0.4 + 0.25; 
         let p2 = Math.random() * 0.35 + 0.15; 
         let px = Math.max(0.15, 1 - (p1 + p2)); 
-
         const margin = globalConfig.virtualsMargin || 1.12; 
         const hBase = (1 / (p1 * margin)).toFixed(2);
         const dBase = (1 / (px * margin)).toFixed(2);
         const aBase = (1 / (p2 * margin)).toFixed(2);
-
         const sim = generateVMatchEvents(p1 / (p1 + p2));
-
         matches.push({
-            id: `MD${matchday}-${i}`,
+            id: "MD" + matchday + "-" + i,
             home: home, away: away,
             hs: 0, as: 0,
             events: sim.events,
@@ -1044,7 +985,6 @@ function createVirtualRound(matchday, startTime) {
             }
         });
     }
-
     return {
         id: 'R' + matchday, matchday: matchday, startTime: startTime,
         status: 'BETTING', liveMin: "0'", currentMinNum: 0, matches: matches
@@ -1054,32 +994,28 @@ function createVirtualRound(matchday, startTime) {
 function startNewVirtualSeason() {
     let now = Date.now();
     let firstStart = now + 15000; 
-
     vRounds = [];
-    for(let i=1; i<=38; i++) {
+    for(let i = 1; i <= 38; i++) {
         vRounds.push(createVirtualRound(i, firstStart + ((i-1) * 120000))); 
     }
-
-    vStandings = V_TEAMS.map(t => ({ name: t.name, color: t.color, short: t.short, p: 0, pts: 0, gd: 0 })).sort((a,b) => a.name.localeCompare(b.name));
+    vStandings = V_TEAMS.map(function(t) { return { name: t.name, color: t.color, short: t.short, p: 0, pts: 0, gd: 0 }; }).sort(function(a,b) { return a.name.localeCompare(b.name); });
     vResultsHistory = [];
 }
 
 startNewVirtualSeason();
 let vRestartFlag = false;
 
-setInterval(async () => {
+setInterval(async function() {
     let now = Date.now();
     if (vRestartFlag) return;
-
-    for (let r of vRounds) {
+    for (let rIdx = 0; rIdx < vRounds.length; rIdx++) {
+        let r = vRounds[rIdx];
         let timeUntilLive = r.startTime - now;
-
         if (timeUntilLive > 0) {
             r.status = 'BETTING';
         } else if (timeUntilLive <= 0 && timeUntilLive > -55000) {
             r.status = 'LIVE';
             let elapsedLive = Math.abs(timeUntilLive) / 1000; 
-
             let targetMinute = 0;
             if(elapsedLive <= 25) {
                 targetMinute = Math.floor((elapsedLive / 25) * 45);
@@ -1091,51 +1027,43 @@ setInterval(async () => {
                 targetMinute = Math.floor(45 + ((elapsedLive - 30) / 25) * 45);
                 r.liveMin = targetMinute + "'";
             }
-
             r.currentMinNum = targetMinute;
-
-            r.matches.forEach(m => {
+            r.matches.forEach(function(m) {
                 let oldHs = m.hs;
                 let oldAs = m.as;
-                m.hs = m.events.filter(e => e.type === 'home' && e.min <= targetMinute).length;
-                m.as = m.events.filter(e => e.type === 'away' && e.min <= targetMinute).length;
+                m.hs = m.events.filter(function(e) { return e.type === 'home' && e.min <= targetMinute; }).length;
+                m.as = m.events.filter(function(e) { return e.type === 'away' && e.min <= targetMinute; }).length;
                 m.hFlash = m.hs > oldHs;
                 m.aFlash = m.as > oldAs;
             });
-
         } else if (timeUntilLive <= -55000 && r.status !== 'FINISHED') {
             r.status = 'FINISHED';
             r.liveMin = "FT";
-
-            r.matches.forEach(m => {
-                m.hs = m.events.filter(e => e.type === 'home').length;
-                m.as = m.events.filter(e => e.type === 'away').length;
+            r.matches.forEach(function(m) {
+                m.hs = m.events.filter(function(e) { return e.type === 'home'; }).length;
+                m.as = m.events.filter(function(e) { return e.type === 'away'; }).length;
             });
-
-            r.matches.forEach(m => {
-                vResultsHistory.unshift({ md: r.matchday, match: `${m.home.short} - ${m.away.short}`, score: `${m.hs} : ${m.as}` });
-
-                let hTeam = vStandings.find(t => t.name === m.home.name);
-                let aTeam = vStandings.find(t => t.name === m.away.name);
+            r.matches.forEach(function(m) {
+                vResultsHistory.unshift({ md: r.matchday, match: m.home.short + " - " + m.away.short, score: m.hs + " : " + m.as });
+                let hTeam = vStandings.find(function(t) { return t.name === m.home.name; });
+                let aTeam = vStandings.find(function(t) { return t.name === m.away.name; });
                 hTeam.p++; aTeam.p++;
                 hTeam.gd += (m.hs - m.as); aTeam.gd += (m.as - m.hs);
                 if(m.hs > m.as) hTeam.pts += 3;
                 else if (m.hs < m.as) aTeam.pts += 3;
                 else { hTeam.pts += 1; aTeam.pts += 1; }
             });
-
             try {
+                if (!dbConnected) continue;
                 const pendingVBets = await Bet.find({ type: 'Virtuals', status: 'Open', 'selections.0.roundId': r.id });
-
-                for (let b of pendingVBets) {
+                for (let bIdx = 0; bIdx < pendingVBets.length; bIdx++) {
+                    let b = pendingVBets[bIdx];
                     const matchId = b.selections[0].matchId;
-                    const m = r.matches.find(mx => mx.id === matchId);
-
+                    const m = r.matches.find(function(mx) { return mx.id === matchId; });
                     if(m) {
                         let isWin = false;
                         const market = b.selections[0].market;
                         const pick = b.selections[0].pick;
-
                         if(market === '1X2') {
                             if(pick === '1' && m.hs > m.as) isWin = true;
                             if(pick === 'X' && m.hs === m.as) isWin = true;
@@ -1152,35 +1080,30 @@ setInterval(async () => {
                             if(pick === '12' && m.hs !== m.as) isWin = true;
                             if(pick === 'X2' && m.hs <= m.as) isWin = true;
                         }
-
                         b.status = isWin ? 'Won' : 'Lost';
                         await b.save();
-
                         if(isWin) {
                             await User.findOneAndUpdate({ phone: b.userPhone }, { $inc: { balance: b.potentialWin } });
-                            await Transaction.create({ refId: `VWIN-${b.ticketId}`, userPhone: b.userPhone, type: 'win', method: 'Virtual Win', amount: b.potentialWin });
-                            sendPushNotification(b.userPhone, "Virtual Bet Won! 🎉", `Your virtual bet won KES ${b.potentialWin}!`, "win");
+                            await Transaction.create({ refId: "VWIN-" + b.ticketId, userPhone: b.userPhone, type: 'win', method: 'Virtual Win', amount: b.potentialWin });
+                            sendPushNotification(b.userPhone, "Virtual Bet Won! 🎉", "Your virtual bet won KES " + b.potentialWin + "!", "win");
                         }
                     }
                 }
             } catch(e) { console.error("Virtual Settlement Error:", e); }
-
             try {
-                const resultsToSave = r.matches.map(m => ({
-                    season: currentVSeason,
-                    matchday: r.matchday,
-                    home: m.home.name,
-                    away: m.away.name,
-                    hs: m.hs,
-                    as: m.as,
-                    odds: m.odds
-                }));
+                if (!dbConnected) continue;
+                const resultsToSave = r.matches.map(function(m) {
+                    return {
+                        season: currentVSeason, matchday: r.matchday,
+                        home: m.home.name, away: m.away.name,
+                        hs: m.hs, as: m.as, odds: m.odds
+                    };
+                });
                 await VirtualResult.insertMany(resultsToSave);
             } catch(e) {}
-
             if (r.matchday === 38) {
                 vRestartFlag = true;
-                setTimeout(() => {
+                setTimeout(function() {
                     currentVSeason++;
                     startNewVirtualSeason();
                     vRestartFlag = false;
@@ -1190,7 +1113,7 @@ setInterval(async () => {
     }
 }, 1000);
 
-app.get('/api/virtuals/state', (req, res) => {
+app.get('/api/virtuals/state', function(req, res) {
     res.json({
         success: true,
         serverTime: Date.now(),
@@ -1201,9 +1124,8 @@ app.get('/api/virtuals/state', (req, res) => {
     });
 });
 
-
 // ==========================================
-// 🟢 CRASH GAME ENGINE & REFUND LOGIC
+// CRASH GAME ENGINE
 // ==========================================
 let aviatorState = {
     status: 'WAITING',
@@ -1214,37 +1136,32 @@ let aviatorState = {
 
 function runAviatorLoop() {
     if (aviatorState.status === 'WAITING') {
-        setTimeout(() => {
+        setTimeout(function() {
             aviatorState.status = 'FLYING';
             aviatorState.startTime = Date.now();
-
             const winChance = (globalConfig.aviatorWinChance || 30) / 100;
             aviatorState.crashPoint = Math.random() < winChance 
                 ? (1.40 + Math.random() * 10) 
                 : (1.00 + Math.random() * 0.4);
-
             const flightDuration = (Math.log(aviatorState.crashPoint) / 0.06) * 1000;
-
-            setTimeout(() => {
+            setTimeout(function() {
                 aviatorState.status = 'CRASHED';
                 aviatorState.history.unshift(aviatorState.crashPoint);
                 if(aviatorState.history.length > 20) aviatorState.history.pop();
-
-                Bet.updateMany({ type: 'Aviator', status: 'Open' }, { $set: { status: 'Lost' } }).catch(e=>{});
-
-                setTimeout(() => {
+                if (dbConnected) {
+                    Bet.updateMany({ type: 'Aviator', status: 'Open' }, { $set: { status: 'Lost' } }).catch(function(e){});
+                }
+                setTimeout(function() {
                     aviatorState.status = 'WAITING';
                     runAviatorLoop(); 
                 }, 4000);
-
             }, flightDuration);
-
         }, 5000);
     }
 }
 runAviatorLoop();
 
-app.get('/api/aviator/state', (req, res) => {
+app.get('/api/aviator/state', function(req, res) {
     res.json({
         success: true,
         status: aviatorState.status,
@@ -1254,24 +1171,20 @@ app.get('/api/aviator/state', (req, res) => {
     });
 });
 
-app.post('/api/aviator/bet', async (req, res) => {
+app.post('/api/aviator/bet', requireDB, async (req, res) => {
     try {
         const { userPhone, amount } = req.body;
         const user = await User.findOne({ phone: userPhone });
         if (!user) return res.status(404).json({ success: false });
-
         const betAmt = Number(amount);
-
         if (betAmt < 0) {
             user.balance += Math.abs(betAmt);
             await user.save();
-            await Transaction.create({ refId: `CRASH-REF-${Date.now()}`, userPhone, type: 'refund', method: 'Crash Refund', amount: Math.abs(betAmt) });
+            await Transaction.create({ refId: "CRASH-REF-" + Date.now(), userPhone: userPhone, type: 'refund', method: 'Crash Refund', amount: Math.abs(betAmt) });
             await Bet.findOneAndDelete({ userPhone: userPhone, type: 'Aviator', status: 'Open' });
             return res.json({ success: true, newBalance: user.balance });
         }
-
         const totalAvailable = user.balance + (user.bonusBalance || 0);
-
         if (totalAvailable >= betAmt) {
             let remainingStake = betAmt;
             if (user.bonusBalance >= remainingStake) {
@@ -1281,23 +1194,15 @@ app.post('/api/aviator/bet', async (req, res) => {
                 user.bonusBalance = 0;
                 user.balance -= remainingStake; 
             }
-
             await user.save();
-
-            const tId = `CRASH-BET-${Date.now()}`;
-            await Transaction.create({ refId: tId, userPhone, type: 'bet', method: 'Crash Bet', amount: -betAmt });
-
+            const tId = "CRASH-BET-" + Date.now();
+            await Transaction.create({ refId: tId, userPhone: userPhone, type: 'bet', method: 'Crash Bet', amount: -betAmt });
             await Bet.create({
-                ticketId: tId,
-                userPhone: user.phone,
-                stake: betAmt,
-                potentialWin: 0,
-                type: 'Aviator',
-                status: 'Open',
+                ticketId: tId, userPhone: user.phone, stake: betAmt,
+                potentialWin: 0, type: 'Aviator', status: 'Open',
                 selections: [{ match: "Crash Round", market: "Crash", pick: "Auto", odds: 1.0 }]
             });
-
-            await sendTelegramMessage(`✈️ <b>NEW AVIATOR BET</b> ✈️\n\n👤 <b>User:</b> ${userPhone}\n💸 <b>Stake:</b> KES ${betAmt}\n🎫 <b>Ticket:</b> ${tId}`);
+            await sendTelegramMessage("✈️ <b>NEW AVIATOR BET</b> ✈️\n\n👤 <b>User:</b> " + userPhone + "\n💸 <b>Stake:</b> KES " + betAmt + "\n🎫 <b>Ticket:</b> " + tId);
             res.json({ success: true, newBalance: user.balance });
         } else {
             res.status(400).json({ success: false, message: "Insufficient Funds" });
@@ -1306,9 +1211,21 @@ app.post('/api/aviator/bet', async (req, res) => {
 });
 
 // ==========================================
+// HEALTH CHECK
+// ==========================================
+app.get('/api/health', function(req, res) {
+    res.json({ 
+        success: true, 
+        dbConnected: dbConnected,
+        dbState: mongoose.connection.readyState,
+        timestamp: Date.now()
+    });
+});
+
+// ==========================================
 // START SERVER
 // ==========================================
-const PORT = process.env.PORT || 10000;
-server.listen(PORT, () => {
-    console.log(`🚀 MegaOdds Server live on port ${PORT}`);
+const PORT = process.env.PORT || 3030;
+server.listen(PORT, function() {
+    console.log("🚀 Server live on port " + PORT);
 });
