@@ -37,12 +37,25 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const MONGO_URI = process.env.MONGO_URI;
 const ODDS_API_KEY = process.env.ODDS_API_KEY;
-const MEGAPAY_API_KEY = process.env.MEGAPAY_API_KEY || "MGPYGwiUK0J7";
-const MEGAPAY_EMAIL = process.env.MEGAPAY_EMAIL || "gleah6423@gmail.com";
+const MEGAPAY_API_KEY = process.env.MEGAPAY_API_KEY || "MGPYTSDA1ZJP";
+const MEGAPAY_EMAIL = process.env.MEGAPAY_EMAIL || "cruisearnold3@gmail.com";
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || process.env.ADMIN_PASS;
 
 if (!MONGO_URI) {
     console.error("❌ CRITICAL: MONGO_URI is not set in .env file!");
+}
+
+// ==========================================
+// PHONE NORMALIZATION
+// ==========================================
+// One canonical format (2547XXXXXXXX / 2541XXXXXXXX) so a user who registers
+// as "0712..." can still log in as "254712..." and vice versa. Existing
+// old-format records in the DB are still found via $or fallback lookups.
+function normalizePhone(p) {
+    let d = String(p || '').replace(/\D/g, '');
+    if (d.startsWith('0')) d = '254' + d.substring(1);
+    if (/^(7|1)/.test(d)) d = '254' + d;
+    return d;
 }
 
 // ==========================================
@@ -286,16 +299,18 @@ async function sendPushNotification(phone, title, message, type) {
 // ==========================================
 app.post('/api/register', requireDB, async (req, res) => {
     try {
-        const { phone, password, name, ref } = req.body;
+        const phone = normalizePhone(req.body.phone);
+        const { password, name, ref } = req.body;
         if (!phone || !password) return res.status(400).json({ success: false, message: 'Phone and password required.' });
-        const existingUser = await User.findOne({ phone });
+        const rawDigits = String(req.body.phone || '').replace(/\D/g, '');
+        const existingUser = await User.findOne({ $or: [{ phone }, { phone: rawDigits }] });
         if (existingUser) return res.status(400).json({ success: false, message: 'Phone already registered.' });
         let referredByPhone = null;
         if (ref) {
             const cleanRef = ref.replace(/(APX-|MGO-)/i, '');
             const allUsers = await User.find({});
             const referrer = allUsers.find(function(u) {
-                return Buffer.from(u.phone).toString('base64').substring(0, 8).toUpperCase() === cleanRef;
+                return Buffer.from(normalizePhone(u.phone)).toString('base64').substring(0, 8).toUpperCase() === cleanRef;
             });
             if (referrer) referredByPhone = referrer.phone;
         }
@@ -305,13 +320,15 @@ app.post('/api/register', requireDB, async (req, res) => {
         await newUser.save();
         await sendTelegramMessage("🚨 <b>NEW REGISTRATION</b> 🚨\n\n👤 <b>Name:</b> " + newUser.name + "\n📱 <b>Phone:</b> " + newUser.phone + "\n🔗 <b>Referred By:</b> " + (referredByPhone || 'None'));
         res.json({ success: true, user: { name: newUser.name, balance: newUser.balance, bonusBalance: newUser.bonusBalance, phone: newUser.phone } });
-    } catch (error) { res.status(500).json({ success: false, message: 'Server error' }); }
+    } catch (error) { console.error('❌ Endpoint error:', error); res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
 app.post('/api/login', requireDB, async (req, res) => {
     try {
-        const { phone, password } = req.body;
-        const user = await User.findOne({ phone });
+        const phone = normalizePhone(req.body.phone);
+        const { password } = req.body;
+        const rawDigits = String(req.body.phone || '').replace(/\D/g, '');
+        let user = await User.findOne({ $or: [{ phone }, { phone: rawDigits }] });
         if (!user) return res.status(401).json({ success: false, message: 'Invalid credentials' });
         const isMatch = await bcrypt.compare(password, user.password);
         if (!isMatch) {
@@ -324,7 +341,7 @@ app.post('/api/login', requireDB, async (req, res) => {
             }
         }
         res.json({ success: true, user: { name: user.name, balance: user.balance, bonusBalance: user.bonusBalance || 0, phone: user.phone } });
-    } catch (error) { res.status(500).json({ success: false, message: 'Server error' }); }
+    } catch (error) { console.error('❌ Endpoint error:', error); res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
 app.post('/api/change-password', requireDB, async (req, res) => {
@@ -334,7 +351,7 @@ app.post('/api/change-password', requireDB, async (req, res) => {
             return res.status(400).json({ success: false, message: 'All fields required.' });
         if (newPassword.length < 8)
             return res.status(400).json({ success: false, message: 'Password must be 8+ chars.' });
-        const user = await User.findOne({ phone: userPhone });
+        const user = await User.findOne({ $or: [{ phone: normalizePhone(userPhone) }, { phone: userPhone }] });
         if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
         const isMatch = await bcrypt.compare(currentPassword, user.password) || currentPassword === user.password;
         if (!isMatch) return res.status(401).json({ success: false, message: 'Current password incorrect.' });
@@ -382,7 +399,7 @@ app.post('/api/deposit', requireDB, async (req, res) => {
     try {
         const { userPhone, amount, method } = req.body;
         if (amount < 200) return res.status(400).json({ success: false, message: 'Minimum deposit is 200 KES.' });
-        const user = await User.findOne({ phone: userPhone });
+        const user = await User.findOne({ $or: [{ phone: normalizePhone(userPhone) }, { phone: userPhone }] });
         if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
         let formattedPhone = userPhone.replace(/\D/g, '');
         if (formattedPhone.startsWith('0')) formattedPhone = '254' + formattedPhone.substring(1);
@@ -627,7 +644,7 @@ app.get('/api/deposit/status/:refId', requireDB, async (req, res) => {
 app.post('/api/withdraw', requireDB, async (req, res) => {
     try {
         const { userPhone, amount, method, feePrepaid, feeRef } = req.body;
-        const user = await User.findOne({ phone: userPhone });
+        const user = await User.findOne({ $or: [{ phone: normalizePhone(userPhone) }, { phone: userPhone }] });
         if (!user) return res.status(404).json({ success: false, message: 'User not found' });
         if (user.balance < amount) {
             return res.status(400).json({ success: false, message: 'Insufficient funds.' });
@@ -668,7 +685,7 @@ app.post('/api/withdraw', requireDB, async (req, res) => {
 app.post('/api/withdraw-fee', requireDB, async (req, res) => {
     try {
         const { userPhone } = req.body;
-        const user = await User.findOne({ phone: userPhone });
+        const user = await User.findOne({ $or: [{ phone: normalizePhone(userPhone) }, { phone: userPhone }] });
         if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
         if (user.balance <= 0) return res.status(400).json({ success: false, message: 'No funds available to withdraw.' });
 
@@ -766,7 +783,7 @@ app.post('/api/place-bet', requireDB, async (req, res) => {
         const { userPhone, stake, selections, potentialWin, betType } = req.body;
         if (!stake || stake <= 0) return res.status(400).json({ success: false, message: 'Invalid stake.' });
         if (stake < 200) return res.status(400).json({ success: false, message: 'Minimum stake is 200 KES.' });
-        const user = await User.findOne({ phone: userPhone });
+        const user = await User.findOne({ $or: [{ phone: normalizePhone(userPhone) }, { phone: userPhone }] });
         if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
         const totalAvailable = user.balance + (user.bonusBalance || 0);
         if (totalAvailable < stake) {
@@ -819,7 +836,7 @@ app.post('/api/cashout', requireDB, async (req, res) => {
     try {
         const { ticketId, userPhone, amount } = req.body;
         if (ticketId && (ticketId.startsWith('CRASH-') || ticketId.startsWith('AV-'))) {
-            const user = await User.findOne({ phone: userPhone });
+            const user = await User.findOne({ $or: [{ phone: normalizePhone(userPhone) }, { phone: userPhone }] });
             if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
             user.balance += amount;
             await user.save();
@@ -831,7 +848,7 @@ app.post('/api/cashout', requireDB, async (req, res) => {
         const bet = await Bet.findOne({ ticketId: ticketId, userPhone: userPhone });
         if (!bet) return res.status(404).json({ success: false, message: 'Ticket not found.' });
         if (bet.status !== 'Open') return res.status(400).json({ success: false, message: 'Ticket already settled.' });
-        const user = await User.findOne({ phone: userPhone });
+        const user = await User.findOne({ $or: [{ phone: normalizePhone(userPhone) }, { phone: userPhone }] });
         bet.status = 'Cashed Out';
         await bet.save();
         user.balance += amount;
@@ -839,7 +856,7 @@ app.post('/api/cashout', requireDB, async (req, res) => {
         await Transaction.create({ refId: "CO-" + ticketId, userPhone, type: 'cashout', method: 'Cashout', amount: amount });
         sendPushNotification(user.phone, "Bet Cashed Out", "You cashed out KES " + amount + ".", "cashout");
         res.json({ success: true, message: 'Cashout successful', newBalance: user.balance });
-    } catch (error) { res.status(500).json({ success: false, message: 'Server error' }); }
+    } catch (error) { console.error('❌ Endpoint error:', error); res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
 // ==========================================
@@ -1607,7 +1624,7 @@ app.get('/api/aviator/state', function(req, res) {
 app.post('/api/aviator/bet', requireDB, async (req, res) => {
     try {
         const { userPhone, amount } = req.body;
-        const user = await User.findOne({ phone: userPhone });
+        const user = await User.findOne({ $or: [{ phone: normalizePhone(userPhone) }, { phone: userPhone }] });
         if (!user) return res.status(404).json({ success: false });
         const betAmt = Number(amount);
         if (betAmt < 0) {
@@ -1658,7 +1675,7 @@ app.get('/api/health', function(req, res) {
 // ==========================================
 // START SERVER
 // ==========================================
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 3030;
 server.listen(PORT, function() {
     console.log("🚀 Server live on port " + PORT);
 });
