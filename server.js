@@ -765,7 +765,7 @@ app.post('/api/place-bet', requireDB, async (req, res) => {
     try {
         const { userPhone, stake, selections, potentialWin, betType } = req.body;
         if (!stake || stake <= 0) return res.status(400).json({ success: false, message: 'Invalid stake.' });
-        if (stake < 300) return res.status(400).json({ success: false, message: 'Minimum stake is 300 KES.' });
+        if (stake < 200) return res.status(400).json({ success: false, message: 'Minimum stake is 200 KES.' });
         const user = await User.findOne({ phone: userPhone });
         if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
         const totalAvailable = user.balance + (user.bonusBalance || 0);
